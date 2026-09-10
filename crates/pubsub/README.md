@@ -72,16 +72,46 @@ subscribers.
 When a user issues a subscription request, the **frontend** sends a
 subscription request to the **service**. The **service** dispatches it to the
 RPC server via the **backend**. The **service** then intercepts the RPC server
-response containing the serve id, and assigns a `local_id` to the subscription.
-This `local_id` is used to identify the subscription in the **service** and in
-tasks consuming the subscription, while the `server_id` is used to identify the
-subscription to the RPC server, and to associate notifications with specific
-active subscriptions.
+response containing the server ID and assigns a stable `B256` `local_id` to
+the subscription. Server IDs are represented by [`alloy_json_rpc::SubId`] and
+may be numeric or strings. The `local_id` identifies the subscription in the
+**service** and consumer tasks, while the current `server_id` associates
+notifications with the server-side subscription.
 
-This allows us to use long-lived `local_id` values to manage subscriptions over
-multiple reconnections, without having to notify frontend users of the ID change
-when the server connection is lost. It also prevents race conditions when
-unsubscribing during or immediately after a reconnection.
+This allows the service to keep the consumer-facing `local_id` stable while the
+server ID changes across reconnections.
+
+### Reconnection, replay, and cancellation
+
+After a connection failure, the service preserves completed responses and returns
+unresolved ordinary requests to the caller with a transport error. It does not
+replay ordinary requests. The caller owns read retries and must decide which
+methods are safe to retry. The service restores active subscriptions and pending
+subscription requests that are still live.
+
+Dropping a request future cancels its pending service entry. Use
+[`with_request_deadline`] to attach a monotonic deadline to a future's requests;
+the service processes cancellation and expiration during both reconnect attempts
+and backoff. Expired reads do not stop active subscriptions. Cancellation cannot
+undo work already received by the remote server. [`PartialBatchError`] retains
+completed per-ID responses when other batch items fail.
+
+Transient reconnect failures use [`RecoveryBackoff`]: the delay ceiling starts
+at 100 ms, doubles to a 500 ms cap, and each delay samples between half and all
+of its ceiling. Reconnects continue until recovery, a permanent failure, or closure
+of all frontends. The former retry-count and retry-interval builder settings
+have been removed. Native WebSocket handshake statuses 408, 429, 500, 502, 503,
+and 504 retain their HTTP type and permit reconnection; authentication failures
+terminate it.
+
+Likewise, dropping a [`RawSubscription`] or
+[`Subscription`] only drops that receiver; it does not send
+`eth_unsubscribe`. Call [`PubSubFrontend::unsubscribe`] with the local ID when
+the server-side subscription is no longer needed. `unsubscribe` only queues
+the instruction and does not wait for the server's response. It is best effort:
+an unsubscribe processed while reconnection is re-creating the subscription can
+race with the replacement response, so it is not confirmation of server-side
+teardown.
 
 ### What is a subscription request?
 
