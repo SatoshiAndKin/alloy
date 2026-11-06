@@ -51,42 +51,37 @@ impl IpcBackend {
             let (read, mut writer) = self.stream.split();
             let mut read = ReadJsonStream::new(read).fuse();
 
-            let err = loop {
-                select! {
-                    biased;
-                    item = self.interface.recv_from_frontend() => {
-                        match item {
-                            Some(msg) => {
-                                let bytes = msg.get();
-                                if let Err(err) = writer.write_all(bytes.as_bytes()).await {
-                                    error!(%err, "Failed to write to IPC socket");
-                                    break true;
-                                }
-                            },
-                            // dispatcher has gone away, or shutdown was received
-                            None => {
-                                debug!("Frontend has gone away");
-                                break false;
-                            },
-                        }
-                    }
-                    // Read from the socket.
-                    item = read.next() => {
-                        match item {
-                            Some(item) => {
-                                if self.interface.send_to_frontend(item).is_err() {
-                                    debug!("Frontend has gone away");
-                                    break false;
-                                }
-                            }
-                            None => {
-                                // Stream ended; upstream already logged the cause (EOF or JSON error).
-                                debug!("IPC read stream ended");
-                                break true;
-                            }
-                        }
+            let to_frontend = self.interface.frontend_sender();
+            // Keep one ordered writer, but continue reading while a write is
+            // pending. A peer may need us to drain its response before it can
+            // read the rest of our request.
+            let writes = async {
+                while let Some(msg) = self.interface.recv_from_frontend().await {
+                    if let Err(err) = writer.write_all(msg.get().as_bytes()).await {
+                        error!(%err, "Failed to write to IPC socket");
+                        return true;
                     }
                 }
+                debug!("Frontend has gone away");
+                false
+            };
+            let reads = async {
+                while let Some(item) = read.next().await {
+                    if to_frontend.send(item).is_err() {
+                        debug!("Frontend has gone away");
+                        return false;
+                    }
+                }
+                // Upstream already logged the cause (EOF or JSON error).
+                debug!("IPC read stream ended");
+                true
+            };
+            // First completion cancels the other direction. In particular,
+            // frontend shutdown must also cancel a blocked socket write.
+            let err = select! {
+                _ = to_frontend.closed() => false,
+                err = reads => err,
+                err = writes => err,
             };
             if err {
                 self.interface.close_with_error();
@@ -402,6 +397,197 @@ mod tests {
     use alloy_json_rpc::{PubSubItem, ResponsePayload};
     use serde_json::value::RawValue;
     use std::future::poll_fn;
+
+    /// The server writes the first response before it drains the second request.
+    /// Both messages exceed the socket buffers, so progress requires full duplex IO.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reads_response_while_request_write_is_blocked() {
+        use alloy_json_rpc::Request;
+        use alloy_pubsub::PubSubConnect;
+        use std::time::Duration;
+        use tokio::{io::AsyncReadExt, sync::oneshot, task::JoinSet, time::timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplex.ipc");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (first_read_tx, first_read_rx) = oneshot::channel();
+        let (drain_tx, drain_rx) = oneshot::channel();
+        let large_params = "a".repeat(4 * 1024 * 1024);
+        let second = Request::new("second", 2.into(), [large_params]).serialize().unwrap();
+        let second_bytes = second.serialized().get().as_bytes().to_vec();
+        let result = "b".repeat(4 * 1024 * 1024);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": result,
+        }))
+        .unwrap();
+
+        // JoinSet aborts the server on a failed assertion or timeout.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = stream.into_split();
+            let first = ReadJsonStream::<_, Box<RawValue>>::new(&mut reader).next().await.unwrap();
+            assert!(first.get().contains("first"));
+            first_read_tx.send(()).unwrap();
+            let mut prefix = [0];
+            reader.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix[0], second_bytes[0]);
+            writer.write_all(&response).await.unwrap();
+            drain_rx.await.unwrap();
+            let mut rest = vec![0; second_bytes.len() - 1];
+            reader.read_exact(&mut rest).await.unwrap();
+            assert_eq!(rest, second_bytes[1..]);
+            writer.write_all(br#"{"jsonrpc":"2.0","id":2,"result":"0x2"}"#).await.unwrap();
+        });
+
+        let frontend = IpcConnect::new(path).into_service().await.unwrap();
+        let first = Request::new("first", 1.into(), ()).serialize().unwrap();
+        let exchange = async {
+            let first = frontend.send(first);
+            tokio::pin!(first);
+            // Poll the first call until the server confirms receipt.
+            select! {
+                response = &mut first => panic!("response arrived before the server wrote: {response:?}"),
+                received = first_read_rx => received.unwrap(),
+            }
+            let second = frontend.send(second);
+            tokio::pin!(second);
+            let first = select! {
+                response = &mut first => response.unwrap(),
+                response = &mut second => panic!("second response arrived first: {response:?}"),
+            };
+            assert_eq!(first.id, 1.into());
+            let ResponsePayload::Success(raw) = first.payload else { panic!("expected success") };
+            assert_eq!(serde_json::from_str::<String>(raw.get()).unwrap(), result);
+            drain_tx.send(()).unwrap();
+            let second = second.await.unwrap();
+            assert_eq!(second.id, 2.into());
+            let ResponsePayload::Success(raw) = second.payload else { panic!("expected success") };
+            assert_eq!(raw.get(), "\"0x2\"");
+            tasks.join_next().await.unwrap().unwrap();
+        };
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("blocked request write must not prevent response reads");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_frontend_cancels_blocked_write() {
+        use alloy_json_rpc::Request;
+        use alloy_pubsub::PubSubConnect;
+        use std::time::Duration;
+        use tokio::{io::AsyncReadExt, sync::oneshot, task::JoinSet, time::timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shutdown.ipc");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (drain_tx, drain_rx) = oneshot::channel();
+        let request =
+            Request::new("large", 1.into(), ["a".repeat(4 * 1024 * 1024)]).serialize().unwrap();
+        let request_len = request.serialized().get().len();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0];
+            stream.read_exact(&mut prefix).await.unwrap();
+            started_tx.send(()).unwrap();
+            drain_rx.await.unwrap();
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.len() < request_len - 1, "shutdown must cancel the pending write");
+        });
+
+        let frontend = IpcConnect::new(path).into_service().await.unwrap();
+        let exchange = async {
+            {
+                let call = frontend.send(request);
+                tokio::pin!(call);
+                select! {
+                    response = &mut call => panic!("server sent no response: {response:?}"),
+                    started = started_rx => started.unwrap(),
+                }
+            }
+            drop(frontend);
+            drain_tx.send(()).unwrap();
+            tasks.join_next().await.unwrap().unwrap();
+        };
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("frontend shutdown must close a blocked IPC socket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_failure_cancels_blocked_write() {
+        use alloy_json_rpc::Request;
+        use alloy_pubsub::{ConnectionHandle, PubSubConnect};
+        use alloy_transport::{TransportErrorKind, TransportResult};
+        use std::{
+            path::PathBuf,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        };
+        use tokio::{io::AsyncReadExt, sync::oneshot, task::JoinSet, time::timeout};
+
+        struct NoReconnect(IpcConnect<PathBuf>, Arc<AtomicUsize>);
+        impl PubSubConnect for NoReconnect {
+            fn is_local(&self) -> bool {
+                true
+            }
+            async fn connect(&self) -> TransportResult<ConnectionHandle> {
+                self.0.connect().await
+            }
+            async fn try_reconnect(&self) -> TransportResult<ConnectionHandle> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                Err(TransportErrorKind::non_retryable_str("test reconnect stopped"))
+            }
+        }
+
+        // Keep the server's reader open. Only EOF or invalid JSON on its write
+        // half can release the client; a failed client write cannot mask the bug.
+        for invalid_json in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("read-error.ipc");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (mut reader, mut writer) = stream.into_split();
+                let mut prefix = [0];
+                reader.read_exact(&mut prefix).await.unwrap();
+                if invalid_json {
+                    writer.write_all(b"invalid").await.unwrap();
+                } else {
+                    writer.shutdown().await.unwrap();
+                }
+                stop_rx.await.unwrap();
+                drop(reader);
+            });
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let frontend = NoReconnect(IpcConnect::new(path), reconnects.clone())
+                .into_service()
+                .await
+                .unwrap();
+            let request =
+                Request::new("large", 1.into(), ["a".repeat(4 * 1024 * 1024)]).serialize().unwrap();
+            let error = timeout(Duration::from_secs(5), frontend.send(request))
+                .await
+                .expect("read failure must cancel a pending IPC write")
+                .unwrap_err();
+            // The service drops pending requests when reconnect terminates.
+            assert!(error.as_transport_err().unwrap().is_backend_gone());
+            assert_eq!(reconnects.load(Ordering::Relaxed), 1);
+            stop_tx.send(()).unwrap();
+            tasks.join_next().await.unwrap().unwrap();
+        }
+    }
 
     const JSON_RPC_ERROR: &[u8] = br#"{
         "jsonrpc": "2.0",
