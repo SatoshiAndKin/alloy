@@ -115,6 +115,14 @@ impl ConnectionInterface {
         self.to_frontend.send(item)
     }
 
+    /// Clone the response sender for independent read and write futures.
+    ///
+    /// The sender's [`mpsc::UnboundedSender::closed`] future resolves when the
+    /// handle is dropped or shut down. Backends can use it to cancel pending IO.
+    pub fn frontend_sender(&self) -> mpsc::UnboundedSender<PubSubItem> {
+        self.to_frontend.clone()
+    }
+
     /// Receive a request from the frontend. Ensures that if the frontend has
     /// dropped or issued a shutdown instruction, the backend sees no more
     /// requests.
@@ -146,5 +154,26 @@ impl ConnectionInterface {
     /// kind triggers the normal reconnect-with-retries path.
     pub fn close_with_transport_error(self, err: TransportError) {
         let _ = self.error.send(err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_sender_observes_handle_drop_and_shutdown() {
+        for shutdown in [false, true] {
+            let (handle, interface) = ConnectionHandle::new();
+            let sender = interface.frontend_sender();
+            assert!(!sender.is_closed());
+            if shutdown {
+                handle.shutdown();
+            } else {
+                drop(handle);
+            }
+            sender.closed().await;
+            assert!(sender.is_closed());
+        }
     }
 }
