@@ -1093,7 +1093,6 @@ dependencies = [
 name = "alloy-transport-ws"
 version = "2.5.0"
 dependencies = [
- "alloy-json-rpc",
  "alloy-pubsub",
  "alloy-transport",
  "futures",

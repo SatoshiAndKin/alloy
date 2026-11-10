@@ -9,10 +9,8 @@
 #[macro_use]
 extern crate tracing;
 
-use alloy_json_rpc::PubSubItem;
 use alloy_pubsub::ConnectionInterface;
 use std::time::Duration;
-use tokio::sync::mpsc::error::SendError;
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -59,27 +57,21 @@ impl<T> WsBackend<T> {
     /// Handle inbound text from the websocket.
     #[expect(clippy::result_unit_err)]
     pub fn handle_text(&mut self, text: &str) -> Result<(), ()> {
-        handle_text_with(text, |item| self.interface.send_to_frontend(item))
-    }
-}
+        trace!(%text, "received message from websocket");
 
-fn handle_text_with(
-    text: &str,
-    send: impl FnOnce(PubSubItem) -> Result<(), SendError<PubSubItem>>,
-) -> Result<(), ()> {
-    trace!(%text, "received message from websocket");
-    match serde_json::from_str(text) {
-        Ok(item) => {
-            trace!(?item, "deserialized message");
-            if let Err(err) = send(item) {
-                error!(item=?err.0, "failed to send deserialized item to handler");
+        match serde_json::from_str(text) {
+            Ok(item) => {
+                trace!(?item, "deserialized message");
+                if let Err(err) = self.interface.send_to_frontend(item) {
+                    error!(item=?err.0, "failed to send deserialized item to handler");
+                    return Err(());
+                }
+            }
+            Err(err) => {
+                error!(%err, "failed to deserialize message");
                 return Err(());
             }
         }
-        Err(err) => {
-            error!(%err, "failed to deserialize message");
-            return Err(());
-        }
+        Ok(())
     }
-    Ok(())
 }
