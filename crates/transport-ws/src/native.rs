@@ -3,7 +3,10 @@ use alloy_pubsub::PubSubConnect;
 use alloy_transport::{utils::Spawnable, Authorization, TransportErrorKind, TransportResult};
 use futures::{SinkExt, StreamExt};
 use serde_json::value::RawValue;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::time::sleep;
 use tokio_tungstenite::{
     tungstenite::{self, client::IntoClientRequest, Message},
@@ -178,22 +181,7 @@ impl WsBackend<TungsteniteStream> {
     /// Handle a message from the server.
     #[expect(clippy::result_unit_err)]
     pub fn handle(&mut self, msg: Message) -> Result<(), ()> {
-        match msg {
-            Message::Text(text) => self.handle_text(&text),
-            Message::Close(frame) => {
-                if frame.is_some() {
-                    error!(?frame, "Received close frame with data");
-                } else {
-                    error!("WS server has gone away");
-                }
-                Err(())
-            }
-            Message::Binary(_) => {
-                error!("Received binary message, expected text");
-                Err(())
-            }
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
-        }
+        handle_message(msg, |text| self.handle_text(text))
     }
 
     /// Send a message to the server.
@@ -204,91 +192,96 @@ impl WsBackend<TungsteniteStream> {
     /// Spawn a new backend task.
     pub fn spawn(mut self) {
         let fut = async move {
-            let mut errored = false;
-            let mut expecting_pong = false;
+            let (mut writer, mut reader) = self.socket.split();
+            let to_frontend = self.interface.frontend_sender();
+            // Both futures run in this task. This flag carries no associated
+            // data; relaxed loads/stores only track receipt of a pong.
+            let expecting_pong = AtomicBool::new(false);
             let keepalive = sleep(self.keepalive_interval);
             tokio::pin!(keepalive);
-            loop {
-                // We bias the loop as follows
-                // 1. New dispatch to server.
-                // 2. Keepalive.
-                // 3. Response or notification from server.
-                // This ensures that keepalive is sent only if no other messages
-                // have been sent in the keepalive interval. And prioritizes new
-                // dispatches over responses from the server. This will fail if
-                // the client saturates the task with dispatches, but that's
-                // probably not a big deal.
-                tokio::select! {
-                    biased;
-                    // we've received a new dispatch, so we send it via
-                    // websocket. We handle new work before processing any
-                    // responses from the server.
-                    inst = self.interface.recv_from_frontend() => {
-                        match inst {
-                            Some(msg) => {
-                                // Reset the keepalive timer.
-                                keepalive.set(sleep(self.keepalive_interval));
-                                if let Err(err) = self.send(msg).await {
-                                    error!(%err, "WS connection error");
-                                    errored = true;
-                                    break
-                                }
-                            },
-                            // dispatcher has gone away, or shutdown was received
-                            None => {
-                                break
-                            },
+            let writes = async {
+                loop {
+                    let message = tokio::select! {
+                        request = self.interface.recv_from_frontend() => {
+                            let Some(request) = request else { return false };
+                            keepalive.set(sleep(self.keepalive_interval));
+                            Message::Text(request.get().to_owned().into())
                         }
-                    },
-                    // Send a ping to the server, if no other messages have been
-                    // sent within the keepalive interval.
-                    _ = &mut keepalive => {
-                        // Still expecting a pong from the previous ping,
-                        // meaning connection is errored.
-                        if expecting_pong {
-                            error!("WS server missed a pong");
-                            errored = true;
-                            break
-                        }
-                        // Reset the keepalive timer.
-                        keepalive.set(sleep(self.keepalive_interval));
-                        if let Err(err) = self.socket.send(Message::Ping(Default::default())).await {
-                            error!(%err, "WS connection error");
-                            errored = true;
-                            break
-                        }
-                        // Expecting to receive a pong before the next
-                        // keepalive timer resolves.
-                        expecting_pong = true;
-                    }
-                    resp = self.socket.next() => {
-                        match resp {
-                            Some(Ok(item)) => {
-                                if item.is_pong() {
-                                    expecting_pong = false;
-                                }
-                                errored = self.handle(item).is_err();
-                                if errored { break }
-                            },
-                            Some(Err(err)) => {
-                                error!(%err, "WS connection error");
-                                errored = true;
-                                break
+                        _ = &mut keepalive => {
+                            if expecting_pong.swap(true, Ordering::Relaxed) {
+                                error!("WS server missed a pong");
+                                return true;
                             }
-                            None => {
-                                error!("WS server has gone away");
-                                errored = true;
-                                break
-                            },
+                            keepalive.set(sleep(self.keepalive_interval));
+                            Message::Ping(Default::default())
+                        }
+                    };
+                    // The split sink releases its lock on Pending. Responses
+                    // and control frames can be read while this flush waits.
+                    if let Err(err) = writer.send(message).await {
+                        error!(%err, "WS connection error");
+                        return true;
+                    }
+                }
+            };
+            let reads = async {
+                while let Some(response) = reader.next().await {
+                    match response {
+                        Ok(item) => {
+                            if item.is_pong() {
+                                expecting_pong.store(false, Ordering::Relaxed);
+                            }
+                            if handle_message(item, |text| {
+                                crate::handle_text_with(text, |item| to_frontend.send(item))
+                            })
+                            .is_err()
+                            {
+                                return true;
+                            }
+                        }
+                        Err(err) => {
+                            error!(%err, "WS connection error");
+                            return true;
                         }
                     }
                 }
-            }
+                error!("WS server has gone away");
+                true
+            };
+            // A terminal read, write, or frontend shutdown cancels the other
+            // direction, including a send blocked by socket backpressure.
+            let errored = tokio::select! {
+                _ = to_frontend.closed() => false,
+                errored = reads => errored,
+                errored = writes => errored,
+            };
             if errored {
                 self.interface.close_with_error();
             }
         };
         fut.spawn_task()
+    }
+}
+
+fn handle_message(
+    msg: Message,
+    handle_text: impl FnOnce(&str) -> Result<(), ()>,
+) -> Result<(), ()> {
+    match msg {
+        Message::Text(text) => handle_text(&text),
+        Message::Close(frame) => {
+            if frame.is_some() {
+                error!(?frame, "Received close frame with data");
+            } else {
+                error!("WS server has gone away");
+            }
+            Err(())
+        }
+        Message::Binary(_) => {
+            error!("Received binary message, expected text");
+            Err(())
+        }
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
     }
 }
 

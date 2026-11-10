@@ -23,6 +23,7 @@ rustdoc-args = [
 workspace = true
 
 [dependencies]
+alloy-json-rpc.workspace = true
 alloy-pubsub.workspace = true
 alloy-transport.workspace = true
 
@@ -49,3 +50,6 @@ aws-lc-rs = ["rustls-tls", "rustls?/aws-lc-rs"]
 ring = ["rustls-tls", "rustls?/ring"]
 native-tls = ["tokio-tungstenite/native-tls"]
 rustls-tls = ["dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }
