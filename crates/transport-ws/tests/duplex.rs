@@ -1,5 +1,7 @@
 //! WebSocket duplex, keepalive, and cancellation regressions on real TCP sockets.
 
+#![cfg(not(target_family = "wasm"))]
+
 use alloy_json_rpc::{Request, ResponsePayload};
 use alloy_pubsub::PubSubConnect;
 use alloy_transport_ws::WsConnect;
