@@ -1,7 +1,7 @@
 use crate::{Response, ResponsePayload};
 use alloy_primitives::U256;
 use serde::{
-    de::{MapAccess, Visitor},
+    de::{MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
 
@@ -45,6 +45,8 @@ pub struct EthNotification<T = Box<serde_json::value::RawValue>> {
 pub enum PubSubItem {
     /// A [`Response`] to a JSON-RPC request.
     Response(Response),
+    /// A JSON-RPC response array from an explicit native batch.
+    Batch(Vec<Response>),
     /// An Ethereum-style notification.
     Notification(EthNotification),
 }
@@ -72,7 +74,19 @@ impl<'de> Deserialize<'de> for PubSubItem {
             type Value = PubSubItem;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a JSON-RPC response or an Ethereum-style notification")
+                formatter
+                    .write_str("a JSON-RPC response, response array, or subscription notification")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut replies = Vec::new();
+                while let Some(reply) = seq.next_element()? {
+                    replies.push(reply);
+                }
+                Ok(PubSubItem::Batch(replies))
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>

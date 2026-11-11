@@ -13,6 +13,7 @@ pub(crate) fn to_name(path: &std::ffi::OsStr) -> io::Result<ls::Name<'_>> {
 #[derive(Clone, Debug)]
 pub struct IpcConnect<T> {
     inner: T,
+    wire_batches: bool,
 }
 
 impl<T> IpcConnect<T> {
@@ -22,7 +23,13 @@ impl<T> IpcConnect<T> {
     where
         Self: alloy_pubsub::PubSubConnect,
     {
-        Self { inner }
+        Self { inner, wire_batches: false }
+    }
+
+    /// Enable explicit native batches for a node that accepts JSON-RPC arrays over IPC.
+    pub const fn with_wire_batches(mut self, enabled: bool) -> Self {
+        self.wire_batches = enabled;
+        self
     }
 }
 
@@ -30,7 +37,7 @@ macro_rules! impl_connect {
     ($target:ty => | $inner:ident | $map:expr) => {
         impl From<$target> for IpcConnect<$target> {
             fn from(inner: $target) -> Self {
-                Self { inner }
+                Self { inner, wire_batches: false }
             }
         }
 
@@ -53,6 +60,7 @@ macro_rules! impl_connect {
                 let name = to_name(inner).map_err(alloy_transport::TransportErrorKind::custom)?;
                 crate::IpcBackend::connect(name)
                     .await
+                    .map(|handle| handle.with_wire_batches(self.wire_batches))
                     .map_err(alloy_transport::TransportErrorKind::custom)
             }
         }

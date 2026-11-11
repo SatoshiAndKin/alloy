@@ -1,4 +1,5 @@
 use crate::{
+    batches::PendingBatches,
     handle::ConnectionHandle,
     ix::PubSubInstruction,
     managers::{InFlight, RequestManager, SubscriptionManager},
@@ -40,6 +41,7 @@ pub(crate) struct PubSubService<T> {
 
     /// The request manager.
     pub(crate) in_flights: RequestManager,
+    batches: PendingBatches,
 }
 
 impl<T: PubSubConnect> PubSubService<T> {
@@ -47,6 +49,7 @@ impl<T: PubSubConnect> PubSubService<T> {
     pub(crate) async fn connect(connector: T) -> TransportResult<PubSubFrontend> {
         let handle = connector.connect().await?;
 
+        let wire_batches = handle.wire_batches;
         let (tx, reqs) = mpsc::unbounded_channel();
         let this = Self {
             handle,
@@ -54,9 +57,10 @@ impl<T: PubSubConnect> PubSubService<T> {
             reqs,
             subs: SubscriptionManager::default(),
             in_flights: Default::default(),
+            batches: Default::default(),
         };
         this.spawn();
-        Ok(PubSubFrontend::new(tx))
+        Ok(PubSubFrontend::new(tx).with_wire_batches(wire_batches))
     }
 
     /// Reconnect by dropping the backend and creating a new one.
@@ -117,6 +121,12 @@ impl<T: PubSubConnect> PubSubService<T> {
     fn service_request(&mut self, in_flight: InFlight) -> TransportResult<()> {
         let brv = in_flight.request();
 
+        if self.handle.wire_batches && self.batches.contains(brv.id()) {
+            let _ = in_flight.tx.send(Err(TransportErrorKind::custom_str(
+                "request ID is in use by a native batch",
+            )));
+            return Ok(());
+        }
         self.dispatch_request(brv.serialized().to_owned())?;
         self.in_flights.insert(in_flight);
 
@@ -149,6 +159,24 @@ impl<T: PubSubConnect> PubSubService<T> {
         trace!(?ix, "servicing instruction");
         match ix {
             PubSubInstruction::Request(in_flight) => self.service_request(in_flight),
+            PubSubInstruction::WireBatch(group, requests, reply) => {
+                if !self.handle.wire_batches {
+                    let _ = reply.send(Err(TransportErrorKind::custom_str(
+                        "native batches are disabled on this connection",
+                    )));
+                    return Ok(());
+                }
+                if let Some(packet) =
+                    self.batches.prepare(group, requests, reply, |id| self.in_flights.contains(id))
+                {
+                    self.dispatch_request(packet)?;
+                }
+                Ok(())
+            }
+            PubSubInstruction::CancelWireBatch(group) => {
+                self.batches.cancel(&group);
+                Ok(())
+            }
             PubSubInstruction::GetSub(alias, tx) => {
                 self.service_get_sub(alias, tx);
                 Ok(())
@@ -160,6 +188,15 @@ impl<T: PubSubConnect> PubSubService<T> {
     /// Handle an item from the backend.
     fn handle_item(&mut self, item: PubSubItem) -> TransportResult<()> {
         match item {
+            PubSubItem::Batch(replies) => {
+                self.batches.finish(replies);
+                Ok(())
+            }
+            PubSubItem::Response(resp)
+                if self.handle.wire_batches && self.batches.reject_single(&resp.id) =>
+            {
+                Ok(())
+            }
             PubSubItem::Response(resp) => match self.in_flights.handle_response(resp) {
                 Some((server_id, in_flight)) => self.handle_sub_response(in_flight, server_id),
                 None => Ok(()),
@@ -200,6 +237,8 @@ impl<T: PubSubConnect> PubSubService<T> {
     /// failures (auth/protocol violations, malformed handshake, etc.) do not
     /// burn the full retry budget.
     async fn reconnect_with_retries(&mut self) -> TransportResult<()> {
+        // Report a batch failure promptly and let its caller decide whether to retry it.
+        self.batches.disconnected();
         let mut retry_count = 0;
         let max_retries = self.handle.max_retries;
         let interval = self.handle.retry_interval;
@@ -451,6 +490,7 @@ mod tests {
             reqs,
             subs: SubscriptionManager::default(),
             in_flights: RequestManager::default(),
+            batches: Default::default(),
         };
         service.spawn();
 
@@ -492,6 +532,7 @@ mod tests {
             reqs,
             subs: SubscriptionManager::default(),
             in_flights: RequestManager::default(),
+            batches: Default::default(),
         };
         service.spawn();
 
@@ -529,6 +570,7 @@ mod tests {
             reqs,
             subs: SubscriptionManager::default(),
             in_flights: RequestManager::default(),
+            batches: Default::default(),
         };
         service.spawn();
 
@@ -564,6 +606,7 @@ mod tests {
             reqs,
             subs: SubscriptionManager::default(),
             in_flights: RequestManager::default(),
+            batches: Default::default(),
         };
         service.spawn();
 

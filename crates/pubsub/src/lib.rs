@@ -9,6 +9,8 @@
 #[macro_use]
 extern crate tracing;
 
+mod batches;
+
 mod connect;
 pub use connect::PubSubConnect;
 
