@@ -641,6 +641,119 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_batch_and_single_reply_independently_on_the_same_stream() {
+        use alloy_json_rpc::Request;
+        use alloy_pubsub::PubSubConnect;
+        use std::time::Duration;
+        use tokio::{sync::oneshot, task::JoinSet, time::timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.ipc");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (batch_read_tx, batch_read_rx) = oneshot::channel();
+        let (reply_batch_tx, reply_batch_rx) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = ReadJsonStream::<_, serde_json::Value>::new(reader);
+            let batch = reader.next().await.unwrap();
+            let batch = batch.as_array().expect("one native array");
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[0]["id"], 1);
+            assert_eq!(batch[1]["id"], 2);
+            batch_read_tx.send(()).unwrap();
+
+            let single = reader.next().await.unwrap();
+            assert_eq!(single["id"], 3);
+            writer.write_all(br#"{"jsonrpc":"2.0","id":3,"result":"single"}"#).await.unwrap();
+
+            // An independent single response must arrive before this batch.
+            reply_batch_rx.await.unwrap();
+            writer.write_all(br#"[{"jsonrpc":"2.0","id":2,"result":"second"},"#).await.unwrap();
+            writer.write_all(br#"{"jsonrpc":"2.0","id":1,"result":"first"}]"#).await.unwrap();
+
+            let malformed = reader.next().await.unwrap();
+            assert_eq!(malformed.as_array().unwrap().len(), 2);
+            writer
+                .write_all(br#"[{"jsonrpc":"2.0","id":4,"result":"only member"}]"#)
+                .await
+                .unwrap();
+
+            let next = reader.next().await.unwrap();
+            assert_eq!(next["id"], 6);
+            writer
+                .write_all(br#"{"jsonrpc":"2.0","id":6,"result":"still connected"}"#)
+                .await
+                .unwrap();
+        });
+
+        let frontend = IpcConnect::new(path).with_wire_batches(true).into_service().await.unwrap();
+        let make_request = |id: u64| Request::new("eth_call", id.into(), ()).serialize().unwrap();
+        timeout(Duration::from_secs(5), async {
+            let batch = frontend.send_wire_batch(vec![make_request(1), make_request(2)]);
+            tokio::pin!(batch);
+            select! {
+                result = &mut batch => panic!("batch replied too early: {result:?}"),
+                observed = batch_read_rx => observed.unwrap(),
+            }
+            let single = frontend.send(make_request(3)).await.unwrap();
+            assert_eq!(single.id, 3.into());
+            reply_batch_tx.send(()).unwrap();
+            let responses = batch.await.unwrap();
+            assert_eq!(
+                responses.iter().map(|reply| reply.id.clone()).collect::<Vec<_>>(),
+                [2.into(), 1.into()]
+            );
+            let malformed = frontend.send_wire_batch(vec![make_request(4), make_request(5)]).await;
+            assert!(malformed.unwrap_err().to_string().contains("missing, unknown, or duplicate"));
+            assert_eq!(frontend.send(make_request(6)).await.unwrap().id, 6.into());
+            tasks.join_next().await.unwrap().unwrap();
+        })
+        .await
+        .expect("IPC framing and concurrent progress");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disconnected_native_batch_is_returned_to_its_caller_without_replay() {
+        use alloy_json_rpc::Request;
+        use alloy_pubsub::PubSubConnect;
+        use std::time::Duration;
+        use tokio::{task::JoinSet, time::timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch-disconnect.ipc");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = ReadJsonStream::<_, serde_json::Value>::new(stream);
+                let batch = reader.next().await.unwrap();
+                assert_eq!(batch.as_array().unwrap().len(), 2);
+            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = ReadJsonStream::<_, serde_json::Value>::new(reader);
+            let next = reader.next().await.unwrap();
+            assert_eq!(next["id"], 3, "a disconnected batch must not be replayed");
+            writer.write_all(br#"{"jsonrpc":"2.0","id":3,"result":true}"#).await.unwrap();
+        });
+        let frontend = IpcConnect::new(path).with_wire_batches(true).into_service().await.unwrap();
+        let make_request = |id: u64| Request::new("eth_call", id.into(), ()).serialize().unwrap();
+        timeout(Duration::from_secs(5), async {
+            let result = frontend.send_wire_batch(vec![make_request(1), make_request(2)]).await;
+            assert!(result.unwrap_err().as_transport_err().unwrap().is_backend_gone());
+            assert_eq!(frontend.send(make_request(3)).await.unwrap().id, 3.into());
+            tasks.join_next().await.unwrap().unwrap();
+        })
+        .await
+        .expect("IPC reconnect and independent request");
+    }
+
     const JSON_RPC_ERROR: &[u8] = br#"{
         "jsonrpc": "2.0",
         "id": 1766,
@@ -875,7 +988,7 @@ mod tests {
                     ResponsePayload::Success(_) => panic!("expected error payload"),
                 }
             }
-            PubSubItem::Notification(_) => panic!("expected response"),
+            _ => panic!("expected response"),
         }
     }
 
@@ -910,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_shape_frame_ends_stream_instead_of_wedging() {
-        // A complete JSON array is a valid frame but not a `PubSubItem`.
+        // A JSON array of scalars is a valid frame but not a response array.
         // Advancing past it must terminate the stream; the old `is_data`
         // path left the bytes in place and spun.
         let mock = tokio_test::io::Builder::new().read(br#"[1,2,3]"#).build();
@@ -944,7 +1057,7 @@ mod tests {
         let item = reader.next().await.expect("large frame should parse");
         match item {
             PubSubItem::Response(resp) => assert_eq!(resp.id, 1.into()),
-            PubSubItem::Notification(_) => panic!("expected response"),
+            _ => panic!("expected response"),
         }
         let examined = reader.bytes_examined();
         assert!(

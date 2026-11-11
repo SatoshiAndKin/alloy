@@ -9,6 +9,10 @@ pub(crate) struct RequestManager {
 }
 
 impl RequestManager {
+    pub(crate) fn contains(&self, id: &Id) -> bool {
+        self.reqs.contains_key(id)
+    }
+
     /// Get the number of in-flight requests.
     pub(crate) fn len(&self) -> usize {
         self.reqs.len()

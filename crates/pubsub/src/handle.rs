@@ -42,6 +42,7 @@ pub struct ConnectionHandle {
     /// Reconnect retries use capped exponential backoff from this base interval.
     /// Default is 3 seconds.
     pub(crate) retry_interval: Duration,
+    pub(crate) wire_batches: bool,
 }
 
 impl ConnectionHandle {
@@ -59,6 +60,7 @@ impl ConnectionHandle {
             shutdown: shutdown_tx,
             max_retries: 10,
             retry_interval: Duration::from_secs(3),
+            wire_batches: false,
         };
         let interface = ConnectionInterface {
             from_frontend,
@@ -81,6 +83,12 @@ impl ConnectionHandle {
     /// Reconnect retries use capped exponential backoff from this base interval.
     pub const fn with_retry_interval(mut self, retry_interval: Duration) -> Self {
         self.retry_interval = retry_interval;
+        self
+    }
+
+    /// Mark the transport as able to carry a native JSON-RPC request array.
+    pub const fn with_wire_batches(mut self, enabled: bool) -> Self {
+        self.wire_batches = enabled;
         self
     }
 
