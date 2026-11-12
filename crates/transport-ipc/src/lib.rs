@@ -693,12 +693,17 @@ mod tests {
         let frontend = IpcConnect::new(path).with_wire_batches(true).into_service().await.unwrap();
         let make_request = |id: u64| Request::new("eth_call", id.into(), ()).serialize().unwrap();
         timeout(Duration::from_secs(5), async {
-            let batch = frontend.send_wire_batch(vec![make_request(1), make_request(2)]);
+            let (observed_tx, observed_rx) = oneshot::channel();
+            let batch = frontend.send_wire_batch_observed(
+                vec![make_request(1), make_request(2)],
+                move |queue, dispatch| observed_tx.send((queue, dispatch)).unwrap(),
+            );
             tokio::pin!(batch);
             select! {
                 result = &mut batch => panic!("batch replied too early: {result:?}"),
                 observed = batch_read_rx => observed.unwrap(),
             }
+            observed_rx.await.unwrap();
             let single = frontend.send(make_request(3)).await.unwrap();
             assert_eq!(single.id, 3.into());
             reply_batch_tx.send(()).unwrap();
