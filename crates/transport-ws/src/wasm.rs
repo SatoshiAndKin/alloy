@@ -25,6 +25,7 @@ pub struct WsConnect {
     /// The interval between keepalive pings.
     /// Default is 10 seconds.
     keepalive_interval: Duration,
+    wire_batches: bool,
 }
 
 impl WsConnect {
@@ -35,6 +36,7 @@ impl WsConnect {
             max_retries: 10,
             retry_interval: Duration::from_secs(3),
             keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE),
+            wire_batches: false,
         }
     }
 
@@ -66,6 +68,12 @@ impl WsConnect {
         self
     }
 
+    /// Allow the pubsub frontend to send native request arrays on this connection.
+    pub const fn with_wire_batches(mut self, enabled: bool) -> Self {
+        self.wire_batches = enabled;
+        self
+    }
+
     /// Get the URL string of the connection.
     pub fn url(&self) -> &str {
         &self.url
@@ -86,7 +94,10 @@ impl PubSubConnect for WsConnect {
 
         backend.spawn();
 
-        Ok(handle.with_max_retries(self.max_retries).with_retry_interval(self.retry_interval))
+        Ok(handle
+            .with_max_retries(self.max_retries)
+            .with_retry_interval(self.retry_interval)
+            .with_wire_batches(self.wire_batches))
     }
 }
 
