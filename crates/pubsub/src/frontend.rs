@@ -1,4 +1,8 @@
-use crate::{ix::PubSubInstruction, managers::InFlight, RawSubscription};
+use crate::{
+    ix::{DispatchObserver, Instant, PubSubInstruction, WireBatchObservation},
+    managers::InFlight,
+    RawSubscription,
+};
 use alloy_json_rpc::{RequestPacket, Response, ResponsePacket, SerializedRequest};
 use alloy_primitives::B256;
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
@@ -10,6 +14,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, debug_span, Instrument};
@@ -45,13 +50,36 @@ impl PubSubFrontend {
         &self,
         requests: Vec<SerializedRequest>,
     ) -> TransportResult<Vec<Response>> {
+        self.send_wire_batch_inner(requests, None).await
+    }
+
+    /// Send a native batch and observe the request queue wait and dispatch work.
+    ///
+    /// The observer runs once on successful dispatch to the socket writer. It receives
+    /// the time to dequeue the instruction and the time to prepare and dispatch the
+    /// packet, in that order. It must return without blocking the pubsub service.
+    pub async fn send_wire_batch_observed(
+        &self,
+        requests: Vec<SerializedRequest>,
+        observe: impl FnOnce(Duration, Duration) + Send + 'static,
+    ) -> TransportResult<Vec<Response>> {
+        self.send_wire_batch_inner(requests, Some(Box::new(observe))).await
+    }
+
+    async fn send_wire_batch_inner(
+        &self,
+        requests: Vec<SerializedRequest>,
+        observe: Option<DispatchObserver>,
+    ) -> TransportResult<Vec<Response>> {
         let sequence = self.wire_batches.as_ref().ok_or_else(|| {
             TransportErrorKind::custom_str("native batches are disabled on this connection")
         })?;
         let id = sequence.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        let observation =
+            observe.map(|observe| WireBatchObservation { queued_at: Instant::now(), observe });
         self.tx
-            .send(PubSubInstruction::WireBatch(id, requests, tx))
+            .send(PubSubInstruction::WireBatch(id, requests, tx, observation))
             .map_err(|_| TransportErrorKind::backend_gone())?;
         let mut cancellation = BatchCancellation { channel: &self.tx, id: Some(id) };
         let result = rx.await.map_err(|_| TransportErrorKind::backend_gone());
@@ -193,7 +221,7 @@ mod tests {
             tokio::select! {
                 result = &mut future => panic!("batch cannot complete before reply: {result:?}"),
                 instruction = rx.recv() => {
-                    let Some(PubSubInstruction::WireBatch(group, requests, reply)) = instruction else {
+                    let Some(PubSubInstruction::WireBatch(group, requests, reply, None)) = instruction else {
                         panic!("expected native batch");
                     };
                     assert_eq!(requests[0].id(), &42.into());

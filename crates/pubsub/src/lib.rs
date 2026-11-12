@@ -18,7 +18,7 @@ mod frontend;
 pub use frontend::PubSubFrontend;
 
 mod ix;
-pub use ix::PubSubInstruction;
+pub use ix::{PubSubInstruction, WireBatchObservation};
 
 mod handle;
 pub use handle::{ConnectionHandle, ConnectionInterface};

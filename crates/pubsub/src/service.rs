@@ -1,7 +1,7 @@
 use crate::{
     batches::PendingBatches,
     handle::ConnectionHandle,
-    ix::PubSubInstruction,
+    ix::{Instant, PubSubInstruction},
     managers::{InFlight, RequestManager, SubscriptionManager},
     PubSubConnect, PubSubFrontend, RawSubscription,
 };
@@ -159,7 +159,8 @@ impl<T: PubSubConnect> PubSubService<T> {
         trace!(?ix, "servicing instruction");
         match ix {
             PubSubInstruction::Request(in_flight) => self.service_request(in_flight),
-            PubSubInstruction::WireBatch(group, requests, reply) => {
+            PubSubInstruction::WireBatch(group, requests, reply, observation) => {
+                let dispatch_started = observation.as_ref().map(|_| Instant::now());
                 if !self.handle.wire_batches {
                     let _ = reply.send(Err(TransportErrorKind::custom_str(
                         "native batches are disabled on this connection",
@@ -170,6 +171,12 @@ impl<T: PubSubConnect> PubSubService<T> {
                     self.batches.prepare(group, requests, reply, |id| self.in_flights.contains(id))
                 {
                     self.dispatch_request(packet)?;
+                    if let Some((observation, started)) = observation.zip(dispatch_started) {
+                        (observation.observe)(
+                            started.saturating_duration_since(observation.queued_at),
+                            started.elapsed(),
+                        );
+                    }
                 }
                 Ok(())
             }
