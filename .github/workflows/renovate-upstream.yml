@@ -1,0 +1,49 @@
+name: Weekly upstream Renovate
+
+on:
+  schedule:
+    - cron: "15 17 * * 1"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Open update pull requests
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: renovate-upstream
+
+jobs:
+  renovate:
+    if: github.repository == 'SatoshiAndKin/alloy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: write
+    steps:
+      - name: Check for a stable upstream release
+        env:
+          RENOVATE_TOKEN: ${{ github.token }}
+          RENOVATE_PLATFORM: github
+          RENOVATE_USERNAME: "github-actions[bot]"
+          RENOVATE_GIT_AUTHOR: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          RENOVATE_FORK_PROCESSING: enabled
+          RENOVATE_AUTODISCOVER: "false"
+          RENOVATE_CONFIG_FILE_NAMES: '[".github/renovate-upstream.json"]'
+          RENOVATE_REQUIRE_CONFIG: required
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_ALLOW_SCRIPTS: "false"
+          RENOVATE_EXIT_CODE_FOR_ERRORS: "true"
+          RENOVATE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.apply && 'full' || '' }}
+        run: |
+          docker run --rm \
+            --env RENOVATE_TOKEN --env RENOVATE_PLATFORM --env RENOVATE_FORK_PROCESSING \
+            --env RENOVATE_USERNAME --env RENOVATE_GIT_AUTHOR --env RENOVATE_CONFIG_FILE_NAMES \
+            --env RENOVATE_AUTODISCOVER --env RENOVATE_REQUIRE_CONFIG --env RENOVATE_ONBOARDING \
+            --env RENOVATE_ALLOW_SCRIPTS --env RENOVATE_EXIT_CODE_FOR_ERRORS --env RENOVATE_DRY_RUN \
+            docker.io/renovate/renovate:44.244.1@sha256:02d6fb4c2e667a70301c747949462e05a805b3c0f568810e6b654d5d2cce97e9 \
+            "$GITHUB_REPOSITORY"
