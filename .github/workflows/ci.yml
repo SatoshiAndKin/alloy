@@ -43,27 +43,27 @@ jobs:
             flags: "--all-features"
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: ${{ matrix.rust }}
       - name: Install Anvil
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: nightly
       - name: Install test binaries
         shell: bash
         run: ./.github/scripts/install_test_binaries.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       # Only run tests on latest stable and above
       - name: Install cargo-nextest
         if: ${{ matrix.rust != '1.94.1' }} # MSRV
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: nextest@0.9.140
           checksum: true
@@ -84,14 +84,14 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - run: cargo test --locked --workspace --doc
@@ -105,21 +105,21 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
           target: wasm32-unknown-unknown
       - name: Install cargo-hack
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: cargo-hack@0.6.45
           checksum: true
           fallback: none
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - name: cargo hack
@@ -149,21 +149,21 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
           target: wasm32-wasip1
       - name: Install cargo-hack
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: cargo-hack@0.6.45
           checksum: true
           fallback: none
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - name: cargo hack
@@ -187,20 +187,20 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
       - name: Install cargo-hack
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: cargo-hack@0.6.45
           checksum: true
           fallback: none
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - name: cargo hack
@@ -215,21 +215,21 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
           targets: riscv32imac-unknown-none-elf
       - name: Install cargo-hack
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: cargo-hack@0.6.45
           checksum: true
           fallback: none
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - run: ./scripts/check_no_std.sh
@@ -242,11 +242,11 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@bbaefadf97b0ec5fdc942684b647f1a6ab250274 # v1.46.0
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
 
   clippy:
     runs-on: ubuntu-latest
@@ -256,15 +256,15 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - run: cargo +stable clippy --locked --workspace --all-targets --all-features
@@ -279,14 +279,14 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - name: Build documentation
@@ -302,11 +302,11 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           toolchain: nightly
           components: rustfmt
@@ -321,12 +321,12 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Zepter
-        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
         with:
           tool: zepter@1.88.1
           checksum: true
@@ -338,45 +338,13 @@ jobs:
           git diff --exit-code -- Cargo.lock
 
   deny:
-    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
     permissions:
       contents: read
       id-token: write
     with:
       rust-toolchain: nightly
       flags: --locked --all-features
-
-  codeql:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      id-token: write
-      contents: read
-      security-events: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - language: actions
-            build-mode: none
-    steps:
-      - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
-        with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
-        with:
-          category: "/language:${{matrix.language}}"
 
   ci-success:
     name: ci success
@@ -395,12 +363,11 @@ jobs:
       - fmt
       - feature-propagation
       - deny
-      - codeql
     permissions:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d5402286a7abdfb7232173b3228d56473feb8a66 # 2026-09-29T02-04-45Z-d5402286
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:

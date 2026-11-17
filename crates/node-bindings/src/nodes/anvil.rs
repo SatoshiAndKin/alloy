@@ -1,6 +1,9 @@
 //! Utilities for launching an Anvil instance.
 
-use crate::{utils::GracefulShutdown, NodeError, NODE_STARTUP_TIMEOUT};
+use crate::{
+    utils::{GracefulShutdown, LineReader, StartupGuard},
+    NodeError, NODE_STARTUP_TIMEOUT,
+};
 use alloy_hardforks::EthereumHardfork;
 use alloy_network::EthereumWallet;
 use alloy_primitives::{hex, Address, ChainId};
@@ -9,7 +12,6 @@ use alloy_signer_local::LocalSigner;
 use k256::{ecdsa::SigningKey, SecretKey as K256SecretKey};
 use std::{
     ffi::OsString,
-    io::{BufRead, BufReader},
     net::SocketAddr,
     path::PathBuf,
     process::{Child, Command},
@@ -281,45 +283,38 @@ impl Anvil {
     }
 
     /// Select the [`EthereumHardfork`] to start anvil with.
-    pub fn hardfork(mut self, hardfork: EthereumHardfork) -> Self {
-        self = self.args(["--hardfork", hardfork.to_string().as_str()]);
-        self
+    pub fn hardfork(self, hardfork: EthereumHardfork) -> Self {
+        self.args(["--hardfork", hardfork.to_string().as_str()])
     }
 
     /// Set the [`EthereumHardfork`] to [`EthereumHardfork::Paris`].
-    pub fn paris(mut self) -> Self {
-        self = self.hardfork(EthereumHardfork::Paris);
-        self
+    pub fn paris(self) -> Self {
+        self.hardfork(EthereumHardfork::Paris)
     }
 
     /// Set the [`EthereumHardfork`] to [`EthereumHardfork::Cancun`].
-    pub fn cancun(mut self) -> Self {
-        self = self.hardfork(EthereumHardfork::Cancun);
-        self
+    pub fn cancun(self) -> Self {
+        self.hardfork(EthereumHardfork::Cancun)
     }
 
     /// Set the [`EthereumHardfork`] to [`EthereumHardfork::Shanghai`].
-    pub fn shanghai(mut self) -> Self {
-        self = self.hardfork(EthereumHardfork::Shanghai);
-        self
+    pub fn shanghai(self) -> Self {
+        self.hardfork(EthereumHardfork::Shanghai)
     }
 
     /// Set the [`EthereumHardfork`] to [`EthereumHardfork::Prague`].
-    pub fn prague(mut self) -> Self {
-        self = self.hardfork(EthereumHardfork::Prague);
-        self
+    pub fn prague(self) -> Self {
+        self.hardfork(EthereumHardfork::Prague)
     }
 
     /// Instantiate `anvil` with the `--odyssey` flag.
-    pub fn odyssey(mut self) -> Self {
-        self = self.arg("--odyssey");
-        self
+    pub fn odyssey(self) -> Self {
+        self.arg("--odyssey")
     }
 
     /// Instantiate `anvil` with the `--auto-impersonate` flag.
-    pub fn auto_impersonate(mut self) -> Self {
-        self = self.arg("--auto-impersonate");
-        self
+    pub fn auto_impersonate(self) -> Self {
+        self.arg("--auto-impersonate")
     }
 
     /// Adds an argument to pass to the `anvil`.
@@ -454,19 +449,18 @@ impl Anvil {
 
         cmd.args(self.args);
 
-        let mut child = cmd.spawn().map_err(NodeError::SpawnError)?;
+        let mut child = StartupGuard::new(cmd.spawn().map_err(NodeError::SpawnError)?);
 
         let stdout = child.stdout.take().ok_or(NodeError::NoStdout)?;
 
         let start = Instant::now();
-        let mut reader = BufReader::new(stdout);
+        let mut reader = LineReader::new(stdout, self.keep_stdout);
         let timeout = self.timeout.map(Duration::from_millis).unwrap_or(NODE_STARTUP_TIMEOUT);
 
         let mut private_keys = Vec::new();
         let mut addresses = Vec::new();
         let mut is_private_key = false;
         let mut chain_id = None;
-        let mut wallet = None;
         loop {
             if start + timeout <= Instant::now() {
                 let _ = child.kill();
@@ -474,7 +468,13 @@ impl Anvil {
             }
 
             let mut line = String::new();
-            reader.read_line(&mut line).map_err(NodeError::ReadLineError)?;
+            if reader.read_line(&mut line).map_err(NodeError::ReadLineError)? == 0 {
+                let _ = child.kill();
+                let status = child.wait().map_err(NodeError::WaitError)?;
+                return Err(NodeError::Fatal(format!(
+                    "anvil exited before it was ready ({status})"
+                )));
+            }
             trace!(target: "alloy::node::anvil", line);
             if let Some(addr) = line.strip_prefix("Listening on") {
                 // <Listening on 127.0.0.1:8545>
@@ -493,7 +493,7 @@ impl Anvil {
                 let key_str =
                     line.split("0x").last().ok_or(NodeError::ParsePrivateKeyError)?.trim();
                 let key_hex = hex::decode(key_str).map_err(NodeError::FromHexError)?;
-                let key = K256SecretKey::from_bytes((&key_hex[..]).into())
+                let key = K256SecretKey::from_slice(&key_hex)
                     .map_err(|_| NodeError::DeserializePrivateKeyError)?;
                 addresses.push(Address::from_public_key(SigningKey::from(&key).verifying_key()));
                 private_keys.push(key);
@@ -505,20 +505,20 @@ impl Anvil {
                     chain_id = Some(chain);
                 };
             }
-
-            if !private_keys.is_empty() {
-                let mut private_keys = private_keys.iter().map(|key| {
-                    let mut signer = LocalSigner::from(key.clone());
-                    signer.set_chain_id(chain_id);
-                    signer
-                });
-                let mut w = EthereumWallet::new(private_keys.next().unwrap());
-                for pk in private_keys {
-                    w.register_signer(pk);
-                }
-                wallet = Some(w);
-            }
         }
+
+        let mut signers = private_keys.iter().map(|key| {
+            let mut signer = LocalSigner::from(key.clone());
+            signer.set_chain_id(chain_id);
+            signer
+        });
+        let wallet = signers.next().map(|signer| {
+            let mut wallet = EthereumWallet::new(signer);
+            for signer in signers {
+                wallet.register_signer(signer);
+            }
+            wallet
+        });
 
         if self.keep_stdout {
             // re-attach the stdout handle if requested
@@ -526,7 +526,7 @@ impl Anvil {
         }
 
         Ok(AnvilInstance {
-            child,
+            child: child.into_child(),
             private_keys,
             addresses,
             wallet,
@@ -551,11 +551,6 @@ mod test {
     }
 
     #[test]
-    fn spawn_and_drop() {
-        let _ = Anvil::new().block_time(12).try_spawn().map(drop);
-    }
-
-    #[test]
     fn can_set_host() {
         let anvil = Anvil::new().host("0.0.0.0").block_time(12).try_spawn();
         if let Ok(anvil) = anvil {
@@ -573,5 +568,76 @@ mod test {
             assert!(anvil.endpoint().starts_with("http://localhost:"));
             assert!(anvil.ws_endpoint().starts_with("ws://localhost:"));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod early_exit_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn early_exit_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("anvil");
+        std::fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = Anvil::at(&program).try_spawn().unwrap_err();
+        assert!(matches!(err, NodeError::Fatal(_)), "{err:?}");
+    }
+
+    #[test]
+    fn invalid_private_key_lengths_are_reported() {
+        for key in ["01".to_string(), "01".repeat(33)] {
+            let dir = tempfile::tempdir().unwrap();
+            let program = dir.path().join("anvil");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf 'Private Keys\\n(0) 0x{key}\\n'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let err = Anvil::at(&program).try_spawn().unwrap_err();
+            assert!(matches!(err, NodeError::DeserializePrivateKeyError), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn startup_wallet_registers_all_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("anvil");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf 'Private Keys\\n(0) 0x{}\\n(1) 0x{}\\nChain ID: 12345\\nListening on 127.0.0.1:8545\\n'\n",
+                "01".repeat(32),
+                "02".repeat(32),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let anvil = Anvil::at(&program).try_spawn().unwrap();
+        let wallet = anvil.wallet().unwrap();
+        assert_eq!(anvil.keys().len(), 2);
+        assert_eq!(anvil.chain_id(), 12345);
+        assert_eq!(wallet.default_signer().address(), anvil.addresses()[0]);
+        for address in anvil.addresses() {
+            assert_eq!(wallet.signer_by_address(*address).unwrap().address(), *address);
+        }
+    }
+
+    #[test]
+    fn startup_without_keys_has_no_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("anvil");
+        std::fs::write(&program, "#!/bin/sh\necho 'Listening on 127.0.0.1:8545'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let anvil = Anvil::at(&program).try_spawn().unwrap();
+        assert!(anvil.keys().is_empty());
+        assert!(anvil.wallet().is_none());
     }
 }

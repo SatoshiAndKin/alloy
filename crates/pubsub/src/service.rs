@@ -8,7 +8,7 @@ use alloy_json_rpc::{Id, PubSubItem, Request, Response, ResponsePayload, RpcErro
 use alloy_primitives::B256;
 use alloy_transport::{
     utils::{to_json_raw_value, Spawnable},
-    TransportErrorKind, TransportResult,
+    SharedTransportError, TransportError, TransportErrorKind, TransportResult,
 };
 use serde_json::value::RawValue;
 use std::time::Duration;
@@ -120,10 +120,11 @@ impl<T: PubSubConnect> PubSubService<T> {
         if !in_flight.is_subscription() && in_flight.tx.is_closed() {
             return Ok(());
         }
-        let brv = in_flight.request();
-
-        self.dispatch_request(brv.serialized().to_owned())?;
+        let brv = in_flight.request().serialized().to_owned();
+        // Retain the waiter before dispatch: a backend failure must either replay the request
+        // after reconnecting or deliver the terminal connection error to its caller.
         self.in_flights.insert(in_flight);
+        self.dispatch_request(brv)?;
 
         Ok(())
     }
@@ -139,8 +140,11 @@ impl<T: PubSubConnect> PubSubService<T> {
     /// Service an unsubscribe instruction.
     fn service_unsubscribe(&mut self, local_id: B256) -> TransportResult<()> {
         if let Some(server_id) = self.subs.server_id_for(&local_id) {
-            // TODO: ideally we can send this with an unused id
-            let req = Request::new("eth_unsubscribe", Id::Number(1), [server_id]);
+            // A string id keeps the reply from matching a request issued by `RpcClient`,
+            // which allocates numeric ids. It is not tracked in `in_flights`, so the reply is
+            // dropped on arrival.
+            let id = Id::String(format!("unsubscribe-{local_id}"));
+            let req = Request::new("eth_unsubscribe", id, [server_id]);
             let brv = req.serialize().expect("no ser error").take_request();
 
             self.dispatch_request(brv)?;
@@ -184,6 +188,12 @@ impl<T: PubSubConnect> PubSubService<T> {
     ) -> TransportResult<()> {
         let request = in_flight.request;
         let id = request.id().clone();
+
+        // Nobody waits for the response and the subscription is gone, e.g. it was unsubscribed
+        // while being re-issued after a reconnect. Don't re-create it without a consumer.
+        if in_flight.tx.is_closed() && !self.subs.contains(&request.params_hash()) {
+            return Ok(());
+        }
 
         let sub = self.subs.upsert(request, server_id, in_flight.channel_size);
 
@@ -232,6 +242,20 @@ impl<T: PubSubConnect> PubSubService<T> {
         }
     }
 
+    /// Handle the loss of the backend, given the error it reported, if any.
+    ///
+    /// Non-retryable errors are returned, otherwise the backend is reconnected with retries.
+    async fn handle_backend_error(&mut self, err: Option<TransportError>) -> TransportResult<()> {
+        if let Some(err) = err {
+            if matches!(&err, RpcError::Transport(k) if k.is_non_retryable()) {
+                error!(%err, "Pubsub service backend reported a non-retryable error, shutting down.");
+                return Err(err);
+            }
+            error!(%err, "Pubsub service backend error.");
+        }
+        self.reconnect_with_retries().await
+    }
+
     /// Spawn the service.
     pub(crate) fn spawn(mut self) {
         let fut = async move {
@@ -252,14 +276,8 @@ impl<T: PubSubConnect> PubSubService<T> {
                             // It may have also signaled a typed error via the
                             // `error` oneshot; drain it before reconnecting
                             // so a non-retryable error short-circuits the loop.
-                            if let Ok(err) = self.handle.error.try_recv() {
-                                if matches!(&err, RpcError::Transport(k) if k.is_non_retryable()) {
-                                    error!(%err, "Pubsub service backend reported a non-retryable error, shutting down.");
-                                    break Err(err)
-                                }
-                                error!(%err, "Pubsub service backend error.");
-                            }
-                            if let Err(e) = self.reconnect_with_retries().await {
+                            let err = self.handle.error.try_recv().ok();
+                            if let Err(e) = self.handle_backend_error(err).await {
                                 break Err(e)
                             }
                         }
@@ -271,12 +289,7 @@ impl<T: PubSubConnect> PubSubService<T> {
                         // If the sender was dropped without a value, fall back
                         // to a generic backend-gone error.
                         let err = res.unwrap_or_else(|_| TransportErrorKind::backend_gone());
-                        if matches!(&err, RpcError::Transport(k) if k.is_non_retryable()) {
-                            error!(%err, "Pubsub service backend reported a non-retryable error, shutting down.");
-                            break Err(err)
-                        }
-                        error!(%err, "Pubsub service backend error.");
-                        if let Err(e) = self.reconnect_with_retries().await {
+                        if let Err(e) = self.handle_backend_error(Some(err)).await {
                             break Err(e)
                         }
                     }
@@ -305,9 +318,25 @@ impl<T: PubSubConnect> PubSubService<T> {
 
             if let Err(err) = result {
                 error!(%err, "pubsub service reconnection error");
+                self.fail_pending_requests(err).await;
             }
         };
         fut.spawn_task();
+    }
+
+    /// Resolve outstanding requests with the terminal error that stopped the service.
+    async fn fail_pending_requests(&mut self, error: TransportError) {
+        let error = SharedTransportError::new(error);
+        for request in self.in_flights.drain() {
+            let _ = request.tx.send(Err(error.to_error()));
+        }
+        // Requests queued while reconnecting have not entered `in_flights` yet.
+        self.reqs.close();
+        while let Some(instruction) = self.reqs.recv().await {
+            if let PubSubInstruction::Request(request) = instruction {
+                let _ = request.tx.send(Err(error.to_error()));
+            }
+        }
     }
 }
 
@@ -570,13 +599,15 @@ mod tests {
         service.spawn();
 
         let first = Request::new("eth_blockNumber", Id::Number(1), ()).serialize().unwrap();
-        let (in_flight, rx) = InFlight::new(first, 16);
+        let expected_first = first.serialized().get().to_owned();
+        let (in_flight, _rx) = InFlight::new(first, 16);
         tx.send(PubSubInstruction::Request(in_flight)).unwrap();
 
-        timeout(Duration::from_secs(1), rx)
+        let replayed = timeout(Duration::from_secs(1), reconnected_interface.recv_from_frontend())
             .await
-            .expect("failed request should resolve promptly")
-            .expect_err("raced request should be dropped when the backend is gone");
+            .expect("raced request should be replayed after reconnect")
+            .expect("new backend should receive the raced request");
+        assert_eq!(replayed.get(), expected_first);
 
         let second = Request::new("eth_chainId", Id::Number(2), ()).serialize().unwrap();
         let expected = second.serialized().get().to_owned();
@@ -614,10 +645,13 @@ mod tests {
         let (in_flight, rx) = InFlight::new(req, 16);
         tx.send(PubSubInstruction::Request(in_flight)).unwrap();
 
-        timeout(Duration::from_secs(1), rx)
+        let error = timeout(Duration::from_secs(1), rx)
             .await
             .expect("non-retryable reconnect should resolve promptly")
-            .expect_err("request should fail when backend is gone and reconnect aborts");
+            .expect("raced request must receive the terminal error")
+            .unwrap_err();
+        assert!(error.as_transport_err().unwrap().is_non_retryable());
+        assert_eq!(error.to_string(), "non-retryable test failure");
 
         // Exactly one attempt, not `max_retries`.
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -660,6 +694,64 @@ mod tests {
             0,
             "non-retryable backend error must not trigger reconnect attempts"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_reaches_outstanding_requests() {
+        let (handle, mut interface) = ConnectionHandle::new();
+        let (tx, reqs) = mpsc::unbounded_channel();
+        let frontend = PubSubFrontend::new(tx);
+        let service = PubSubService {
+            handle,
+            connector: NonRetryableConnect::default(),
+            reqs,
+            subs: SubscriptionManager::default(),
+            in_flights: RequestManager::default(),
+        };
+        service.spawn();
+
+        let request = Request::new("eth_blockNumber", Id::Number(1), ()).serialize().unwrap();
+        let mut response = Box::pin(frontend.send(request));
+        assert!(futures::poll!(&mut response).is_pending());
+        timeout(Duration::from_secs(1), interface.recv_from_frontend()).await.unwrap().unwrap();
+        interface.close_with_transport_error(TransportErrorKind::non_retryable_str(
+            "authentication failed",
+        ));
+
+        let error = timeout(Duration::from_secs(1), response).await.unwrap().unwrap_err();
+        assert!(error.as_transport_err().unwrap().is_non_retryable());
+        assert_eq!(error.to_string(), "authentication failed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_error_reaches_tracked_and_queued_requests() {
+        let (handle, _interface) = ConnectionHandle::new();
+        let (tx, reqs) = mpsc::unbounded_channel();
+        let mut service = PubSubService {
+            handle,
+            connector: NonRetryableConnect::default(),
+            reqs,
+            subs: SubscriptionManager::default(),
+            in_flights: RequestManager::default(),
+        };
+        let request = Request::new("eth_blockNumber", Id::Number(1), ()).serialize().unwrap();
+        let (tracked, tracked_response) = InFlight::new(request, 16);
+        service.in_flights.insert(tracked);
+        let request = Request::new("eth_chainId", Id::Number(2), ()).serialize().unwrap();
+        let (queued, queued_response) = InFlight::new(request, 16);
+        tx.send(PubSubInstruction::Request(queued)).unwrap();
+
+        service
+            .fail_pending_requests(TransportError::ErrorResp(
+                alloy_json_rpc::ErrorPayload::invalid_request(),
+            ))
+            .await;
+        for response in [tracked_response, queued_response] {
+            let error = response.await.unwrap().unwrap_err();
+            assert_eq!(error.as_error_resp().unwrap().code, -32600);
+        }
+        assert!(tx.is_closed());
+        assert_eq!(service.in_flights.len(), 0);
     }
 
     #[tokio::test]

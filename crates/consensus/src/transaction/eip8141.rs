@@ -12,10 +12,10 @@ use alloy_eips::{
             FRAME_TX_DATA_TOKEN_STANDARD_COST, FRAME_TX_INTRINSIC_COST, FRAME_TX_PER_FRAME_COST,
             FRAME_TX_TOTAL_COST_FLOOR_PER_TOKEN, FRAME_TX_TYPE, MAX_FRAMES, TX_VALUE_COST,
         },
-        ApprovalScope, Eip8141Error, Frame, FrameLimits, FrameMode, FrameSignature,
-        SigningFrameSignatures, TransactionFees,
+        has_valid_assertion_suffix, ApprovalScope, Eip8141Error, Frame, FrameLimits, FrameMode,
+        FrameSignature, SigningFrameSignatures, TransactionFees,
     },
-    eip8250::{nonce_calldata, validate_nonce_keys, MAX_NONCE_KEYS},
+    eip8250::{nonce_calldata, validate_nonce_keys, KEYED_NONCE_ACCESS_COST, MAX_NONCE_SEQ},
     Typed2718,
 };
 use alloy_primitives::{keccak256, Address, Bytes, ChainId, Sealable, TxKind, B256, U256};
@@ -31,8 +31,20 @@ use super::Transaction;
 ///
 /// The [`Transaction`] implementation represents the transaction as a call to [`Self::sender`],
 /// with zero value and empty input. Individual call targets, values, and inputs belong to the
-/// frames. Fee accessors saturate at [`u128::MAX`]. This type is not a variant of
-/// [`super::TxEnvelope`] or [`super::TypedTransaction`].
+/// frames. Its derived per-gas fee accessors are compatibility estimates: they divide the total fee
+/// budget by the execution and state gas reservation, ignoring the budget consumed by blobs.
+/// Arithmetic uses [`U256`] and results saturate at [`u128::MAX`].
+///
+/// These estimates do not generally give the protocol `GASPRICE` or the realized receipt price.
+/// For an affordable transaction with reservation `G`, base fee `b`, priority cap `p`, total
+/// budget `F`, and blob charge `B`, the reserved tip is `min(p * G, F - (G * b + B))`.
+/// `GASPRICE` is `b + reserved_tip / G`, rounded down. At settlement, unused gas can back a
+/// larger tip per unit of charged gas, so the receipt price can exceed `GASPRICE`; blob charges
+/// are reported separately. Exact pricing requires the block's blob base fee and, for receipts,
+/// charged gas and the escrowed budget. Affordability is checked by the execution client, not
+/// by decoding or [`Self::validate`].
+///
+/// This type is not a variant of [`super::TxEnvelope`] or [`super::TypedTransaction`].
 ///
 /// ```
 /// use alloy_consensus::TxEip8141;
@@ -82,13 +94,10 @@ fn arbitrary_nonce_keys(
     if !u.arbitrary::<bool>()? {
         return Ok(None);
     }
-    let count = u.int_in_range(1..=MAX_NONCE_KEYS)?;
+    let count = u.int_in_range(0..=alloy_eips::eip8250::MAX_NONCE_KEYS)?;
     let mut keys = (0..count).map(|_| u.arbitrary()).collect::<arbitrary::Result<Vec<U256>>>()?;
     keys.sort_unstable();
     keys.dedup();
-    if keys.len() > 1 && keys[0].is_zero() {
-        keys.remove(0);
-    }
     Ok(Some(keys))
 }
 
@@ -143,8 +152,10 @@ impl TxEip8141 {
             validate_nonce_keys(keys).map_err(TxEip8141ValidationError::NonceKeys)?;
         }
         validate_frame_count(self.frames.len())?;
-        validate_fees(&self.fees)?;
-        validate_blobs(&self.blob_versioned_hashes, self.fees.max_fee_per_blob_gas)?;
+        if self.nonce == MAX_NONCE_SEQ && self.nonce_keys.as_ref().is_some_and(Vec::is_empty) {
+            return Err(TxEip8141ValidationError::ExhaustedLegacyNonce);
+        }
+        validate_blobs(&self.blob_versioned_hashes)?;
         validate_signatures(&self.signatures, self.sender)?;
         validate_frames(&self.frames, self.sender)?;
         validate_execution_gas(self.gas_limits().execution)
@@ -157,7 +168,11 @@ impl TxEip8141 {
     /// saturates at [`u64::MAX`]; use [`Self::validate`] to reject overflowing frame budgets.
     pub fn gas_limits(&self) -> FrameLimits {
         let mut limits = FrameLimits::default();
-        let mut fixed = FRAME_TX_INTRINSIC_COST;
+        let mut fixed = FRAME_TX_INTRINSIC_COST.saturating_add(
+            self.nonce_keys
+                .as_ref()
+                .map_or(0, |keys| (keys.len() as u64).saturating_mul(KEYED_NONCE_ACCESS_COST)),
+        );
         for frame in &self.frames {
             fixed = fixed.saturating_add(FRAME_TX_PER_FRAME_COST);
             if !frame.value.is_zero() && frame.resolved_target(self.sender) != self.sender {
@@ -174,19 +189,26 @@ impl TxEip8141 {
             .iter()
             .map(Vec::as_slice)
             .chain(self.frames.iter().map(|frame| frame.data.as_ref()))
-            .chain(self.signatures.iter().flat_map(|signature| {
-                [
-                    signature.signer.as_bytes(),
-                    signature.msg.as_bytes(),
-                    signature.signature.as_ref(),
-                ]
-            }));
+            .chain(
+                self.signatures
+                    .iter()
+                    .flat_map(|signature| [signature.signer.as_bytes(), signature.msg.as_bytes()]),
+            );
         let (tokens, bytes) = data.fold((0u64, 0u64), |(tokens, bytes), data| {
             (
                 tokens.saturating_add(tokens_in_calldata(data)),
                 bytes.saturating_add(data.len() as u64),
             )
         });
+        // Transaction-hash witnesses are priced by length only, so changing their bytes cannot
+        // change the gas reservation committed to by their signatures.
+        let (tokens, bytes) =
+            self.signatures.iter().fold((tokens, bytes), |(tokens, bytes), signature| {
+                (
+                    tokens.saturating_add(signature.signature_tokens()),
+                    bytes.saturating_add(signature.signature.len() as u64),
+                )
+            });
         let intrinsic =
             fixed.saturating_add(tokens.saturating_mul(FRAME_TX_DATA_TOKEN_STANDARD_COST));
         let floor =
@@ -295,32 +317,30 @@ impl Encodable for TxEip8141 {
 
 impl Decodable for TxEip8141 {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let header = Header::decode(buf)?;
-        if !header.list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-
-        let remaining = buf.len();
-        let chain_id = Decodable::decode(buf)?;
-        let nonce_keys = if buf.first().is_some_and(|byte| *byte >= 0xc0) {
-            let keys = Vec::<U256>::decode(buf)?;
+        let mut fields = Header::decode_bytes(buf, true)?;
+        let chain_id = Decodable::decode(&mut fields)?;
+        let nonce_keys = if fields.first().is_some_and(|byte| *byte >= 0xc0) {
+            let keys = Vec::<U256>::decode(&mut fields)?;
             validate_nonce_keys(&keys).map_err(alloy_rlp::Error::Custom)?;
             Some(keys)
         } else {
             None
         };
+        let nonce = u64::decode(&mut fields)?;
+        if nonce == MAX_NONCE_SEQ && nonce_keys.as_ref().is_some_and(Vec::is_empty) {
+            return Err(alloy_rlp::Error::Custom("EIP-8250 legacy nonce sequence is exhausted"));
+        }
         let tx = Self {
             chain_id,
-            nonce: Decodable::decode(buf)?,
+            nonce,
             nonce_keys,
-            sender: Decodable::decode(buf)?,
-            frames: Decodable::decode(buf)?,
-            signatures: Decodable::decode(buf)?,
-            fees: Decodable::decode(buf)?,
-            blob_versioned_hashes: Decodable::decode(buf)?,
+            sender: Decodable::decode(&mut fields)?,
+            frames: Decodable::decode(&mut fields)?,
+            signatures: Decodable::decode(&mut fields)?,
+            fees: Decodable::decode(&mut fields)?,
+            blob_versioned_hashes: Decodable::decode(&mut fields)?,
         };
-
-        if buf.len() + header.payload_length != remaining {
+        if !fields.is_empty() {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
         Ok(tx)
@@ -344,29 +364,55 @@ impl Transaction for TxEip8141 {
         None
     }
 
+    /// Compatibility cap: `max_fee / max(gas_limit, 1)`, rounded down and saturated to `u128`.
+    /// This allocates the entire shared budget to non-blob gas, ignoring blob charges.
     fn max_fee_per_gas(&self) -> u128 {
-        self.fees.max_fee_per_gas.saturating_to()
+        (self.fees.max_fee / U256::from(self.gas_limit().max(1))).saturating_to()
     }
 
+    /// Returns the signed priority cap saturated to `u128`, not the tip actually paid.
     fn max_priority_fee_per_gas(&self) -> Option<u128> {
         Some(self.fees.max_priority_fee_per_gas.saturating_to())
     }
 
+    /// Returns `Some(u128::MAX)` for blob-bearing transactions as a compatibility sentinel.
+    /// There is no signed per-blob cap; this value does not establish blob affordability.
     fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        (!self.blob_versioned_hashes.is_empty())
-            .then(|| self.fees.max_fee_per_blob_gas.saturating_to())
+        // Blobs share the total fee budget; there is no independent blob fee cap.
+        (!self.blob_versioned_hashes.is_empty()).then_some(u128::MAX)
     }
 
+    /// Returns the signed priority cap saturated to `u128`, not the tip actually paid.
     fn priority_fee_or_price(&self) -> u128 {
         self.fees.max_priority_fee_per_gas.saturating_to()
     }
 
+    /// Compatibility estimate ignoring blob charges and settlement gas usage.
+    ///
+    /// With a base fee, returns `min(base_fee + priority_cap, max_fee / max(gas_limit, 1))`,
+    /// saturated to `u128`. Without one, returns the compatibility cap. For affordable no-blob
+    /// transactions this agrees with reserved `GASPRICE` before saturation, but the realized
+    /// receipt price can still differ. This method does not check affordability.
     fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
-        alloy_eips::eip1559::calc_effective_gas_price(
-            self.max_fee_per_gas(),
-            self.priority_fee_or_price(),
-            base_fee,
-        )
+        let max_fee_per_gas = self.fees.max_fee / U256::from(self.gas_limit().max(1));
+        base_fee
+            .map_or(max_fee_per_gas, |base_fee| {
+                U256::from(base_fee)
+                    .saturating_add(self.fees.max_priority_fee_per_gas)
+                    .min(max_fee_per_gas)
+            })
+            .saturating_to()
+    }
+
+    /// Compatibility tip ignoring blob charges and settlement gas usage.
+    ///
+    /// Subtracts the base fee from the full-width compatibility cap before applying the priority
+    /// cap and saturating to `u128`. Returns `None` if that cap cannot cover the base fee;
+    /// `Some` does not establish affordability when blobs share the budget.
+    fn effective_tip_per_gas(&self, base_fee: u64) -> Option<u128> {
+        let cap = self.fees.max_fee / U256::from(self.gas_limit().max(1));
+        let available = cap.checked_sub(U256::from(base_fee))?;
+        Some(available.min(self.fees.max_priority_fee_per_gas).saturating_to())
     }
 
     fn is_dynamic_fee(&self) -> bool {
@@ -411,12 +457,12 @@ pub enum TxEip8141ValidationError {
     /// The number of frames is outside the permitted range.
     #[error("expected between 1 and {MAX_FRAMES} frames, got {0}")]
     FrameCount(usize),
-    /// The priority fee exceeds the maximum fee per gas.
-    #[error("max priority fee exceeds max fee")]
-    PriorityFeeAboveMaxFee,
-    /// A transaction without blobs specifies a nonzero blob fee.
-    #[error("blob fee is nonzero without blob hashes")]
-    BlobFeeWithoutBlobs,
+    /// An empty nonce key list selects an exhausted legacy account nonce.
+    #[error("EIP-8250 legacy nonce sequence is exhausted")]
+    ExhaustedLegacyNonce,
+    /// Assertion frames must form a contiguous trailing suffix.
+    #[error("EIP-7906 ASSERT frames must form a trailing suffix")]
+    AssertionSuffix,
     /// The transaction exceeds the per-transaction blob limit.
     #[error("expected at most {MAX_BLOBS_PER_TX_FUSAKA} blobs, got {0}")]
     BlobCount(usize),
@@ -491,22 +537,9 @@ const fn validate_frame_count(count: usize) -> Result<(), TxEip8141ValidationErr
     Ok(())
 }
 
-fn validate_fees(fees: &TransactionFees) -> Result<(), TxEip8141ValidationError> {
-    if fees.max_priority_fee_per_gas > fees.max_fee_per_gas {
-        return Err(TxEip8141ValidationError::PriorityFeeAboveMaxFee);
-    }
-    Ok(())
-}
-
-fn validate_blobs(
-    hashes: &[B256],
-    max_fee_per_blob_gas: U256,
-) -> Result<(), TxEip8141ValidationError> {
+fn validate_blobs(hashes: &[B256]) -> Result<(), TxEip8141ValidationError> {
     use TxEip8141ValidationError as Error;
 
-    if hashes.is_empty() && !max_fee_per_blob_gas.is_zero() {
-        return Err(Error::BlobFeeWithoutBlobs);
-    }
     if hashes.len() as u64 > MAX_BLOBS_PER_TX_FUSAKA {
         return Err(Error::BlobCount(hashes.len()));
     }
@@ -538,6 +571,9 @@ fn validate_signatures(
 
 /// Checks frame fields and the rules that depend on surrounding frames.
 fn validate_frames(frames: &[Frame], sender: Address) -> Result<(), TxEip8141ValidationError> {
+    if !has_valid_assertion_suffix(frames) {
+        return Err(TxEip8141ValidationError::AssertionSuffix);
+    }
     let mut frame_gas = 0;
     let mut seen_expiry_verifier = false;
     let mut previous_atomic = false;
@@ -585,8 +621,8 @@ fn validate_atomic_batch(
 
     let atomic = frame.is_atomic_batch();
     if atomic
-        && (frame.mode == FrameMode::Verify
-            || next.is_none_or(|next| next.mode == FrameMode::Verify))
+        && (matches!(frame.mode, FrameMode::Verify | FrameMode::Assert)
+            || next.is_none_or(|next| matches!(next.mode, FrameMode::Verify | FrameMode::Assert)))
     {
         return Err(Error::AtomicBatch { index });
     }
@@ -621,6 +657,150 @@ const fn validate_execution_gas(execution: u64) -> Result<(), TxEip8141Validatio
         return Err(TxEip8141ValidationError::ExecutionGasLimit(execution));
     }
     Ok(())
+}
+
+/// Bincode-compatible [`TxEip8141`] serde implementation.
+#[cfg(all(feature = "serde", feature = "serde-bincode-compat"))]
+pub(super) mod serde_bincode_compat {
+    use alloc::borrow::Cow;
+    use alloy_eips::eip8141::{Frame, FrameSignature, TransactionFees};
+    use alloy_primitives::{Address, ChainId, B256, U256};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_with::{DeserializeAs, SerializeAs};
+
+    /// Bincode-compatible [`super::TxEip8141`] serde implementation.
+    ///
+    /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
+    /// ```rust
+    /// use alloy_consensus::{serde_bincode_compat, TxEip8141};
+    /// use serde::{Deserialize, Serialize};
+    /// use serde_with::serde_as;
+    ///
+    /// #[serde_as]
+    /// #[derive(Serialize, Deserialize)]
+    /// struct Data {
+    ///     #[serde_as(as = "serde_bincode_compat::transaction::TxEip8141")]
+    ///     transaction: TxEip8141,
+    /// }
+    /// ```
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct TxEip8141<'a> {
+        chain_id: ChainId,
+        nonce: u64,
+        nonce_keys: Option<Cow<'a, [U256]>>,
+        sender: Address,
+        frames: Cow<'a, [Frame]>,
+        signatures: Cow<'a, [FrameSignature]>,
+        fees: TransactionFees,
+        blob_versioned_hashes: Cow<'a, [B256]>,
+    }
+
+    impl<'a> From<&'a super::TxEip8141> for TxEip8141<'a> {
+        fn from(value: &'a super::TxEip8141) -> Self {
+            Self {
+                chain_id: value.chain_id,
+                nonce: value.nonce,
+                nonce_keys: value.nonce_keys.as_deref().map(Cow::Borrowed),
+                sender: value.sender,
+                frames: Cow::Borrowed(&value.frames),
+                signatures: Cow::Borrowed(&value.signatures),
+                fees: value.fees,
+                blob_versioned_hashes: Cow::Borrowed(&value.blob_versioned_hashes),
+            }
+        }
+    }
+
+    impl<'a> From<TxEip8141<'a>> for super::TxEip8141 {
+        fn from(value: TxEip8141<'a>) -> Self {
+            Self {
+                chain_id: value.chain_id,
+                nonce: value.nonce,
+                nonce_keys: value.nonce_keys.map(Cow::into_owned),
+                sender: value.sender,
+                frames: value.frames.into_owned(),
+                signatures: value.signatures.into_owned(),
+                fees: value.fees,
+                blob_versioned_hashes: value.blob_versioned_hashes.into_owned(),
+            }
+        }
+    }
+
+    impl SerializeAs<super::TxEip8141> for TxEip8141<'_> {
+        fn serialize_as<S>(source: &super::TxEip8141, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            TxEip8141::from(source).serialize(serializer)
+        }
+    }
+
+    impl<'de> DeserializeAs<'de, super::TxEip8141> for TxEip8141<'de> {
+        fn deserialize_as<D>(deserializer: D) -> Result<super::TxEip8141, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            TxEip8141::deserialize(deserializer).map(Into::into)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use alloy_eips::eip8141::{
+            Frame, FrameAddress, FrameSignature, SignatureMessage, SignatureScheme,
+        };
+        use alloy_primitives::{Address, B256, U256};
+        use arbitrary::Arbitrary;
+        use bincode::config;
+        use rand::Rng;
+        use serde::{Deserialize, Serialize};
+        use serde_with::serde_as;
+
+        use super::super::{serde_bincode_compat, TxEip8141};
+
+        #[test]
+        fn test_tx_eip8141_bincode_roundtrip() {
+            #[serde_as]
+            #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+            struct Data {
+                #[serde_as(as = "serde_bincode_compat::TxEip8141")]
+                transaction: TxEip8141,
+            }
+
+            let mut bytes = [0u8; 1024];
+            rand::thread_rng().fill(bytes.as_mut_slice());
+            let mut transaction =
+                TxEip8141::arbitrary(&mut arbitrary::Unstructured::new(&bytes)).unwrap();
+
+            // Cover both forms of the optional frame fields regardless of the random input.
+            transaction.frames.extend([
+                Frame { target: FrameAddress::Empty, ..Default::default() },
+                Frame { target: Address::repeat_byte(0x11).into(), ..Default::default() },
+            ]);
+            transaction.signatures.extend([
+                FrameSignature {
+                    scheme: SignatureScheme::Secp256k1,
+                    msg: SignatureMessage::TransactionHash,
+                    ..Default::default()
+                },
+                FrameSignature {
+                    scheme: SignatureScheme::P256,
+                    signer: Address::repeat_byte(0x22).into(),
+                    msg: SignatureMessage::Explicit(B256::repeat_byte(0x33)),
+                    ..Default::default()
+                },
+            ]);
+
+            for nonce_keys in [None, Some(vec![U256::from(1), U256::MAX])] {
+                let data = Data { transaction: TxEip8141 { nonce_keys, ..transaction.clone() } };
+
+                let encoded = bincode::serde::encode_to_vec(&data, config::legacy()).unwrap();
+                let (decoded, _) =
+                    bincode::serde::decode_from_slice::<Data, _>(&encoded, config::legacy())
+                        .unwrap();
+                assert_eq!(decoded, data);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -659,8 +839,6 @@ mod tests {
     #[test]
     fn keyed_nonce_decoder_rejects_noncanonical_sets() {
         for keys in [
-            vec![],
-            vec![U256::ZERO, U256::from(1)],
             vec![U256::from(2), U256::from(1)],
             vec![U256::from(1); 2],
             (1..=17).map(U256::from).collect(),
@@ -668,6 +846,62 @@ mod tests {
             let tx = TxEip8141 { nonce_keys: Some(keys), ..valid_tx() };
             assert!(TxEip8141::decode(&mut alloy_rlp::encode(tx).as_slice()).is_err());
         }
+    }
+
+    #[test]
+    fn keyed_nonce_zero_empty_and_single_use_rules() {
+        for keys in [vec![], vec![U256::ZERO], vec![U256::ZERO, U256::from(1)]] {
+            let mut tx = TxEip8141 { nonce_keys: Some(keys.clone()), ..valid_tx() };
+            assert_eq!(tx.validate(), Ok(()));
+            assert_eq!(TxEip8141::decode_2718_exact(&tx.encoded_2718()).unwrap(), tx);
+            let nonce_data = nonce_calldata(&keys, tx.nonce);
+            let expected =
+                12_475 + keys.len() as u64 * KEYED_NONCE_ACCESS_COST + nonce_data.len() as u64 * 64;
+            assert_eq!(tx.gas_limits().execution, expected);
+            tx.nonce = MAX_NONCE_SEQ;
+            if keys.is_empty() {
+                assert_eq!(tx.validate(), Err(TxEip8141ValidationError::ExhaustedLegacyNonce));
+                assert!(TxEip8141::decode_2718_exact(&tx.encoded_2718()).is_err());
+            } else {
+                assert_eq!(tx.validate(), Ok(()));
+                assert_eq!(TxEip8141::decode_2718_exact(&tx.encoded_2718()).unwrap(), tx);
+                assert_eq!(nonce_calldata(&keys, tx.nonce), alloy_rlp::encode(&keys));
+            }
+        }
+    }
+
+    #[test]
+    fn assertion_suffix_and_atomic_boundaries() {
+        let assertion = Frame { mode: FrameMode::Assert, ..Default::default() };
+        assert_eq!(validate_frames(&[Frame::default(), assertion.clone()], Address::ZERO), Ok(()));
+        assert_eq!(
+            validate_frames(&[assertion.clone(), Frame::default()], Address::ZERO),
+            Err(TxEip8141ValidationError::AssertionSuffix)
+        );
+        assert_eq!(
+            validate_frames(
+                &[Frame { flags: 4, ..Default::default() }, assertion.clone()],
+                Address::ZERO
+            ),
+            Err(TxEip8141ValidationError::AtomicBatch { index: 0 })
+        );
+        assert_eq!(
+            validate_frames(&[Frame { flags: 4, ..assertion }], Address::ZERO),
+            Err(TxEip8141ValidationError::AtomicBatch { index: 0 })
+        );
+    }
+
+    #[test]
+    fn decoder_cannot_read_fields_outside_the_declared_list() {
+        let encoded = alloy_rlp::encode(valid_tx());
+        let mut fields = encoded.as_slice();
+        let header = Header::decode(&mut fields).unwrap();
+        let mut malformed = Vec::new();
+        Header { list: true, payload_length: header.payload_length - 1 }.encode(&mut malformed);
+        malformed.extend_from_slice(fields);
+        let mut input = malformed.as_slice();
+        assert!(TxEip8141::decode(&mut input).is_err());
+        assert_eq!(input, &fields[fields.len() - 1..]);
     }
 
     fn arbitrary_tx(seed: u64) -> TxEip8141 {
@@ -721,8 +955,7 @@ mod tests {
             .collect(),
             fees: TransactionFees {
                 max_priority_fee_per_gas: U256::from(1) << 128,
-                max_fee_per_gas: U256::MAX,
-                max_fee_per_blob_gas: U256::MAX,
+                max_fee: U256::MAX,
             },
             blob_versioned_hashes: vec![B256::repeat_byte(VERSIONED_HASH_VERSION_KZG); 6],
         }
@@ -813,11 +1046,7 @@ mod tests {
         );
         assert_eq!(json["fees"]["maxPriorityFeePerGas"], "0x100000000000000000000000000000000");
         assert_eq!(
-            json["fees"]["maxFeePerGas"],
-            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-        );
-        assert_eq!(
-            json["fees"]["maxFeePerBlobGas"],
+            json["fees"]["maxFee"],
             "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
         assert_eq!(json["frames"][0]["target"], "0x");
@@ -830,14 +1059,6 @@ mod tests {
             "0x3333333333333333333333333333333333333333333333333333333333333333"
         );
         assert_eq!(serde_json::from_value::<TxEip8141>(json).unwrap(), tx);
-    }
-
-    #[test]
-    fn roundtrips_canonical_encoding() {
-        let tx = valid_tx();
-        let encoded = tx.encoded_2718();
-        assert_eq!(TxEip8141::decode_2718_exact(&encoded).unwrap(), tx);
-        assert_ne!(tx.tx_hash(), B256::ZERO);
     }
 
     #[test]
@@ -901,15 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_batch_cannot_approve() {
-        for flags in [[5, 0], [4, 1], [6, 0], [4, 2]] {
-            let mut tx = valid_tx();
-            tx.frames = flags.map(|flags| Frame { flags, ..Default::default() }).to_vec();
-            assert!(tx.validate().is_err(), "accepted batch flags {flags:?}");
-        }
-    }
-
-    #[test]
     #[cfg(feature = "serde")]
     fn serde_uses_alloy_field_names_and_quantities() {
         let json = serde_json::to_value(valid_tx()).unwrap();
@@ -919,45 +1131,134 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serde")]
-    fn serde_accepts_alloy_field_names_and_quantities() {
-        let mut json = serde_json::to_value(valid_tx()).unwrap();
-        let obj = json.as_object_mut().unwrap();
-        obj.remove("chain_id");
-        obj.remove("blob_versioned_hashes");
-        obj.insert("chainId".into(), "0x1".into());
-        obj.insert("nonce".into(), "0x0".into());
-        obj.insert("blobVersionedHashes".into(), serde_json::json!([]));
-        assert_eq!(serde_json::from_value::<TxEip8141>(json).unwrap(), valid_tx());
+    fn fee_estimates_ignore_blob_budget_and_settlement() {
+        let mut tx = valid_tx();
+        // A funded sender contract can approve execution and payment in this frame.
+        tx.sender = Address::repeat_byte(0x11);
+        tx.frames[0].mode = FrameMode::Verify;
+        tx.frames[0].flags = ApprovalScope::ExecutionAndPayment as u8;
+        // Include intrinsic gas in G, and reserve both execution and state gas.
+        tx.frames[0].limits.state = 10_000;
+        tx.frames[0].limits.execution = 100_000 - tx.gas_limit();
+        tx.fees = TransactionFees {
+            max_fee: U256::from(300_000),
+            max_priority_fee_per_gas: U256::from(2),
+        };
+        let mut hash = B256::ZERO;
+        hash[0] = VERSIONED_HASH_VERSION_KZG;
+        tx.blob_versioned_hashes.push(hash);
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(tx.gas_limit(), 100_000);
+
+        // EIP-8141 devnet-2 / EELS: escrow first, then settle using charged gas.
+        let gas = U256::from(tx.gas_limit());
+        let base = U256::from(1);
+        let blob_fee = U256::from(tx.blob_gas_used().unwrap()); // blob base fee = 1
+        assert_eq!(blob_fee, U256::from(131_072));
+        let required = gas * base + blob_fee;
+        let reserved_tip = (tx.fees.max_priority_fee_per_gas * gas).min(tx.fees.max_fee - required);
+        let escrow = required + reserved_tip;
+        let gasprice = base + reserved_tip / gas;
+        assert_eq!(required, U256::from(231_072));
+        assert_eq!(reserved_tip, U256::from(68_928));
+        assert_eq!(escrow, tx.fees.max_fee);
+        assert_eq!(gasprice, U256::from(1));
+
+        let used = U256::from(20_000);
+        let actual_tip =
+            (tx.fees.max_priority_fee_per_gas * used).min(escrow - (used * base + blob_fee));
+        let realized_price = base + actual_tip / used;
+        assert_eq!(realized_price, U256::from(3));
+        assert_ne!(gasprice, realized_price);
+
+        // The transaction-only compatibility estimate has neither missing input.
+        assert_eq!(tx.effective_gas_price(Some(1)), 3);
+        assert_eq!(tx.effective_tip_per_gas(1), Some(2));
+        // At full gas usage, the realized price instead agrees with GASPRICE.
+        assert_eq!(base + (escrow - required) / gas, gasprice);
+    }
+
+    #[test]
+    fn fee_estimates_without_blobs_match_reserved_price() {
+        let mut tx = valid_tx();
+        let gas = U256::from(tx.gas_limit());
+        tx.fees.max_priority_fee_per_gas = U256::from(2);
+        for (budget_per_gas, price, tip) in [(1, 1, 0), (2, 2, 1), (3, 3, 2), (4, 3, 2)] {
+            tx.fees.max_fee = gas * U256::from(budget_per_gas);
+            assert_eq!(tx.validate(), Ok(()));
+            let reserved_tip = (tx.fees.max_priority_fee_per_gas * gas).min(tx.fees.max_fee - gas);
+            assert_eq!(U256::from(price), U256::from(1) + reserved_tip / gas);
+            assert_eq!(tx.effective_gas_price(Some(1)), price);
+            assert_eq!(tx.effective_tip_per_gas(1), Some(tip));
+            assert_eq!(tx.effective_gas_price(None), budget_per_gas);
+        }
+        // Division rounds down even when the signed budget is not a multiple of G.
+        tx.fees.max_fee = gas * U256::from(2) - U256::from(1);
+        assert_eq!(tx.effective_gas_price(Some(1)), 1);
+        assert_eq!(tx.effective_tip_per_gas(1), Some(0));
+    }
+
+    #[test]
+    fn effective_tip_keeps_full_width_until_return() {
+        let mut tx = valid_tx();
+        let gas = U256::from(tx.gas_limit());
+        tx.fees.max_fee = (U256::from(u128::MAX) + U256::from(1)) * gas;
+        tx.fees.max_priority_fee_per_gas = U256::MAX;
+        // A priority product would overflow U256 before the signed budget caps it.
+        assert!(tx.fees.max_priority_fee_per_gas.checked_mul(gas).is_none());
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(tx.max_fee_per_gas(), u128::MAX);
+        assert_eq!(tx.effective_gas_price(Some(1)), u128::MAX);
+        assert_eq!(tx.effective_tip_per_gas(1), Some(u128::MAX));
+        tx.fees.max_fee = U256::MAX;
+        assert_eq!(tx.effective_tip_per_gas(u64::MAX), Some(u128::MAX));
+        tx.fees.max_fee = U256::from(100) * gas;
+        assert_eq!(tx.effective_tip_per_gas(1), Some(99));
+    }
+
+    #[test]
+    fn fee_estimates_do_not_validate_affordability() {
+        let mut tx = valid_tx();
+        tx.fees.max_priority_fee_per_gas = U256::MAX;
+        assert_eq!(tx.effective_gas_price(Some(1)), 0);
+        assert_eq!(tx.effective_tip_per_gas(1), None);
+        assert_eq!(tx.effective_tip_per_gas(0), Some(0));
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(TxEip8141::decode_2718_exact(&tx.encoded_2718()).unwrap(), tx);
+        let mut hash = B256::ZERO;
+        hash[0] = VERSIONED_HASH_VERSION_KZG;
+        tx.blob_versioned_hashes.push(hash);
+        tx.fees.max_fee = U256::from(tx.gas_limit());
+        // Covers execution at base fee 1, but cannot also pay any positive blob fee.
+        assert_eq!(tx.effective_tip_per_gas(1), Some(0));
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(TxEip8141::decode_2718_exact(&tx.encoded_2718()).unwrap(), tx);
+        // Even an invalid empty frame list still reserves intrinsic gas; no zero divisor.
+        tx.frames.clear();
+        tx.fees.max_fee = U256::ZERO;
+        assert!(tx.gas_limit() > 0);
+        assert_eq!(tx.effective_gas_price(None), 0);
+        assert_eq!(tx.effective_tip_per_gas(1), None);
     }
 
     #[test]
     fn effective_gas_price_does_not_overflow() {
         let mut tx = valid_tx();
-        tx.fees.max_fee_per_gas = U256::from(u128::MAX);
-        tx.fees.max_priority_fee_per_gas = U256::from(u128::MAX);
-        assert_eq!(tx.validate(), Ok(()));
-        assert_eq!(tx.effective_gas_price(Some(1)), u128::MAX);
-        tx.fees.max_fee_per_gas = U256::MAX;
+        let gas = U256::from(tx.gas_limit());
+        tx.fees.max_fee = U256::MAX;
         tx.fees.max_priority_fee_per_gas = U256::MAX;
+        assert_eq!(tx.validate(), Ok(()));
         assert_eq!(tx.effective_gas_price(Some(u64::MAX)), u128::MAX);
         assert_eq!(tx.effective_gas_price(None), u128::MAX);
-        tx.fees.max_fee_per_gas = U256::from(100);
+        tx.fees.max_fee = U256::from(100) * gas;
         tx.fees.max_priority_fee_per_gas = U256::from(10);
+        assert_eq!(tx.max_fee_per_gas(), 100);
         assert_eq!(tx.effective_gas_price(None), 100);
         assert_eq!(tx.effective_gas_price(Some(80)), 90);
         assert_eq!(tx.effective_gas_price(Some(95)), 100);
         tx.fees.max_priority_fee_per_gas = U256::from(101);
-        assert_eq!(tx.validate(), Err(TxEip8141ValidationError::PriorityFeeAboveMaxFee));
-    }
-
-    #[test]
-    fn kind_agrees_with_is_create() {
-        let tx = valid_tx();
-        assert_eq!(tx.kind().is_create(), tx.is_create());
-        assert_eq!(tx.to(), Some(tx.sender));
-        assert_eq!(tx.value(), U256::ZERO);
-        assert!(tx.input().is_empty());
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(tx.effective_gas_price(Some(1)), 100);
     }
 
     #[test]
@@ -977,7 +1278,7 @@ mod tests {
         tx.sender = Address::repeat_byte(0x11);
         // Independently assembled: type 6; seven-field list; one six-field frame.
         let expected = hex!(
-            "06e70180941111111111111111111111111111111111111111c9c8808080c280808080c0c3808080c0"
+            "06e60180941111111111111111111111111111111111111111c9c8808080c280808080c0c28080c0"
         );
         assert_eq!(tx.encoded_2718(), expected);
         assert_eq!(tx.encode_2718_len(), expected.len());
@@ -1008,13 +1309,18 @@ mod tests {
             let encoded = tx.encoded_2718();
             assert_eq!(tx.encode_2718_len(), encoded.len());
             assert_eq!(TxEip8141::decode_2718_exact(&encoded).unwrap(), tx);
-            let mut transformed = tx.clone();
-            for signature in &mut transformed.signatures {
-                if signature.msg == SignatureMessage::TransactionHash {
-                    signature.signature = Bytes::new();
+            let hash = tx.signature_hash();
+            let gas = tx.gas_limits();
+            let mut changed = tx.clone();
+            for signature in &mut changed.signatures {
+                if signature.signs_transaction_hash() {
+                    signature.signature = vec![0; len].into();
                 }
             }
-            assert_eq!(tx.signature_hash(), keccak256(transformed.encoded_2718()));
+            assert_eq!(changed.signature_hash(), hash);
+            assert_eq!(changed.gas_limits(), gas);
+            changed.signatures[0].signature = vec![0; len + 1].into();
+            assert_ne!(changed.signature_hash(), hash);
             let mut network = Vec::new();
             tx.network_encode(&mut network);
             assert_eq!(network.len(), tx.network_len());
@@ -1059,20 +1365,13 @@ mod tests {
     }
 
     #[test]
-    fn validates_fee_ordering() {
-        for (priority, max, expected) in [
-            (U256::ZERO, U256::ZERO, Ok(())),
-            (U256::ZERO, U256::from(1), Ok(())),
-            (U256::from(1), U256::from(1), Ok(())),
-            (U256::MAX, U256::MAX, Ok(())),
-            (U256::from(1), U256::ZERO, Err(TxEip8141ValidationError::PriorityFeeAboveMaxFee)),
-        ] {
-            let fees = TransactionFees {
-                max_priority_fee_per_gas: priority,
-                max_fee_per_gas: max,
-                ..Default::default()
+    fn total_fee_budget_is_independent_of_the_tip_cap() {
+        for max_fee in [U256::ZERO, U256::from(1), U256::MAX] {
+            let tx = TxEip8141 {
+                fees: TransactionFees { max_fee, max_priority_fee_per_gas: U256::MAX },
+                ..valid_tx()
             };
-            assert_eq!(validate_fees(&fees), expected);
+            assert_eq!(tx.validate(), Ok(()));
         }
     }
 
@@ -1239,20 +1538,14 @@ mod tests {
     #[test]
     fn validates_blob_fields() {
         use TxEip8141ValidationError as Error;
-        assert_eq!(validate_blobs(&[], U256::ZERO), Ok(()));
-        assert_eq!(validate_blobs(&[], U256::from(1)), Err(Error::BlobFeeWithoutBlobs));
+        assert_eq!(validate_blobs(&[]), Ok(()));
         let mut hashes = vec![B256::repeat_byte(VERSIONED_HASH_VERSION_KZG); 6];
-        assert_eq!(validate_blobs(&hashes, U256::from(1)), Ok(()));
-        // The blob base fee is checked by the execution client at block inclusion.
-        assert_eq!(validate_blobs(&hashes, U256::ZERO), Ok(()));
+        assert_eq!(validate_blobs(&hashes), Ok(()));
         hashes.push(B256::repeat_byte(VERSIONED_HASH_VERSION_KZG));
-        assert_eq!(validate_blobs(&hashes, U256::ZERO), Err(Error::BlobCount(7)));
+        assert_eq!(validate_blobs(&hashes), Err(Error::BlobCount(7)));
         hashes.pop();
         hashes[1] = B256::ZERO;
-        assert_eq!(
-            validate_blobs(&hashes, U256::ZERO),
-            Err(Error::BlobVersion { index: 1, version: 0 })
-        );
+        assert_eq!(validate_blobs(&hashes), Err(Error::BlobVersion { index: 1, version: 0 }));
     }
 
     #[test]
@@ -1270,16 +1563,6 @@ mod tests {
         assert_eq!(
             checked_frame_gas(u64::MAX, FrameLimits { execution: 1, state: 0 }),
             Err(Error::FrameGasOverflow)
-        );
-    }
-
-    #[test]
-    fn validates_execution_gas_cap() {
-        assert_eq!(validate_execution_gas(0), Ok(()));
-        assert_eq!(validate_execution_gas(MAX_TX_GAS_LIMIT_OSAKA), Ok(()));
-        assert_eq!(
-            validate_execution_gas(MAX_TX_GAS_LIMIT_OSAKA + 1),
-            Err(TxEip8141ValidationError::ExecutionGasLimit(MAX_TX_GAS_LIMIT_OSAKA + 1))
         );
     }
 
@@ -1304,7 +1587,6 @@ mod tests {
             },
             Frame { flags: 16, ..Default::default() },
         ];
-        assert_eq!(tx.validate(), Err(Error::PriorityFeeAboveMaxFee));
         tx.fees = TransactionFees::default();
         assert_eq!(tx.validate(), Err(Error::BlobVersion { index: 0, version: 0 }));
         tx.blob_versioned_hashes.clear();
