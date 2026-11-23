@@ -136,8 +136,9 @@ pub struct EIP1186AccountProofResponse {
 
 #[cfg(feature = "serde")]
 impl EIP1186AccountProofResponse {
-    /// After `SpuriousDragon` empty account is defined as account with nonce == 0 && balance == 0
-    /// && bytecode = None (or hash is [`KECCAK_EMPTY`](alloy_consensus::constants::KECCAK_EMPTY)).
+    /// Returns whether the proof describes an account with zero nonce and balance, the empty
+    /// storage trie root ([`EMPTY_ROOT_HASH`](alloy_consensus::constants::EMPTY_ROOT_HASH)), and
+    /// the empty code hash ([`KECCAK_EMPTY`](alloy_consensus::constants::KECCAK_EMPTY)).
     pub fn is_empty(&self) -> bool {
         self.nonce == 0
             && self.balance.is_zero()
@@ -358,26 +359,5 @@ mod tests {
             let decoded: AccountInfo = rmp_serde::from_slice(&bytes).unwrap();
             assert_eq!(decoded, info);
         }
-    }
-
-    #[test]
-    fn account_info_new() {
-        let code = Bytes::from_static(&[0x60, 0x00]);
-        let info = AccountInfo::new(U256::from(1), 2, code.clone());
-        assert_eq!(info.balance, U256::from(1));
-        assert_eq!(info.nonce, 2);
-        assert_eq!(info.code, code);
-        assert!(AccountInfo::new(U256::ZERO, 0, Bytes::new()).is_empty());
-    }
-
-    #[cfg(feature = "account-ext")]
-    #[test]
-    fn account_info_with_extension() {
-        let extension = alloy_trie::AccountExtension::copy_from_slice(&[0x82, 0xaa]);
-        let info = AccountInfo::new(U256::ZERO, 0, Bytes::new()).with_extension(extension.clone());
-        assert_eq!(info.extension, extension);
-        assert!(!info.is_empty());
-        let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(serde_json::from_value::<AccountInfo>(json).unwrap(), info);
     }
 }

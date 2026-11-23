@@ -62,6 +62,9 @@ pub use typed::{EthereumTypedTransaction, TypedTransaction};
 
 mod tx_type;
 
+mod delegate;
+pub(crate) use delegate::delegate_transaction;
+
 mod meta;
 pub use meta::{TransactionInfo, TransactionMeta};
 
@@ -79,8 +82,9 @@ pub use legacy::{signed_legacy_serde, untagged_legacy_serde};
 pub mod serde_bincode_compat {
     pub use super::{
         eip1559::serde_bincode_compat::*, eip2930::serde_bincode_compat::*,
-        eip7702::serde_bincode_compat::*, envelope::serde_bincode_compat::*,
-        legacy::serde_bincode_compat::*, typed::serde_bincode_compat::*,
+        eip7702::serde_bincode_compat::*, eip8141::serde_bincode_compat::*,
+        envelope::serde_bincode_compat::*, legacy::serde_bincode_compat::*,
+        typed::serde_bincode_compat::*,
     };
 }
 
@@ -113,10 +117,13 @@ pub trait Transaction: Typed2718 + fmt::Debug + any::Any + Send + Sync + 'static
     /// For legacy fee transactions this is `gas_price`.
     ///
     /// This is also commonly referred to as the "Gas Fee Cap".
+    ///
+    /// [`TxEip8141`] derives a compatibility estimate from its shared total fee budget;
+    /// it has no signed per-gas fee cap. See that type's documentation for pricing limits.
     fn max_fee_per_gas(&self) -> u128;
 
-    /// For dynamic fee transactions returns the Priority fee the caller is paying to the block
-    /// author.
+    /// For dynamic fee transactions returns the maximum priority fee per gas the caller is willing
+    /// to pay to the block author.
     ///
     /// This will return `None` for legacy fee transactions
     fn max_priority_fee_per_gas(&self) -> Option<u128>;
@@ -140,12 +147,20 @@ pub trait Transaction: Typed2718 + fmt::Debug + any::Any + Send + Sync + 'static
     /// Returns the effective gas price for the given base fee.
     ///
     /// If the transaction is a legacy fee transaction, the gas price is returned.
+    ///
+    /// Implementations with shared fee budgets, such as [`TxEip8141`], can only provide a
+    /// compatibility estimate here. This interface has no blob base fee or charged gas input;
+    /// it does not in general determine protocol `GASPRICE` or a realized receipt price.
     fn effective_gas_price(&self, base_fee: Option<u64>) -> u128;
 
     /// Returns the effective tip for this transaction.
     ///
     /// For dynamic fee transactions: `min(max_fee_per_gas - base_fee, max_priority_fee_per_gas)`.
     /// For legacy fee transactions: `gas_price - base_fee`.
+    ///
+    /// Returns `None` if the per-gas cap is below the base fee. For [`TxEip8141`] this is a
+    /// compatibility estimate ignoring blob charges and settlement gas usage; `Some` does not
+    /// establish affordability of the shared budget at the block's base fees.
     fn effective_tip_per_gas(&self, base_fee: u64) -> Option<u128> {
         let base_fee = base_fee as u128;
 
@@ -311,89 +326,7 @@ pub trait SignableTransaction<Signature>: Transaction {
 
 #[cfg(feature = "serde")]
 impl<T: Transaction> Transaction for alloy_serde::WithOtherFields<T> {
-    #[inline]
-    fn chain_id(&self) -> Option<ChainId> {
-        self.inner.chain_id()
-    }
-
-    #[inline]
-    fn nonce(&self) -> u64 {
-        self.inner.nonce()
-    }
-
-    #[inline]
-    fn gas_limit(&self) -> u64 {
-        self.inner.gas_limit()
-    }
-
-    #[inline]
-    fn gas_price(&self) -> Option<u128> {
-        self.inner.gas_price()
-    }
-
-    #[inline]
-    fn max_fee_per_gas(&self) -> u128 {
-        self.inner.max_fee_per_gas()
-    }
-
-    #[inline]
-    fn max_priority_fee_per_gas(&self) -> Option<u128> {
-        self.inner.max_priority_fee_per_gas()
-    }
-
-    #[inline]
-    fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        self.inner.max_fee_per_blob_gas()
-    }
-
-    #[inline]
-    fn priority_fee_or_price(&self) -> u128 {
-        self.inner.priority_fee_or_price()
-    }
-
-    fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
-        self.inner.effective_gas_price(base_fee)
-    }
-
-    #[inline]
-    fn is_dynamic_fee(&self) -> bool {
-        self.inner.is_dynamic_fee()
-    }
-
-    #[inline]
-    fn kind(&self) -> TxKind {
-        self.inner.kind()
-    }
-
-    #[inline]
-    fn is_create(&self) -> bool {
-        self.inner.is_create()
-    }
-
-    #[inline]
-    fn value(&self) -> U256 {
-        self.inner.value()
-    }
-
-    #[inline]
-    fn input(&self) -> &Bytes {
-        self.inner.input()
-    }
-
-    #[inline]
-    fn access_list(&self) -> Option<&AccessList> {
-        self.inner.access_list()
-    }
-
-    #[inline]
-    fn blob_versioned_hashes(&self) -> Option<&[B256]> {
-        self.inner.blob_versioned_hashes()
-    }
-
-    #[inline]
-    fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
-        self.inner.authorization_list()
-    }
+    delegate_transaction!(self => &self.inner);
 }
 
 impl<L, R> Transaction for either::Either<L, R>
@@ -401,166 +334,7 @@ where
     L: Transaction,
     R: Transaction,
 {
-    fn chain_id(&self) -> Option<ChainId> {
-        match self {
-            Self::Left(tx) => tx.chain_id(),
-            Self::Right(tx) => tx.chain_id(),
-        }
-    }
-
-    fn nonce(&self) -> u64 {
-        match self {
-            Self::Left(tx) => tx.nonce(),
-            Self::Right(tx) => tx.nonce(),
-        }
-    }
-
-    fn gas_limit(&self) -> u64 {
-        match self {
-            Self::Left(tx) => tx.gas_limit(),
-            Self::Right(tx) => tx.gas_limit(),
-        }
-    }
-
-    fn gas_price(&self) -> Option<u128> {
-        match self {
-            Self::Left(tx) => tx.gas_price(),
-            Self::Right(tx) => tx.gas_price(),
-        }
-    }
-
-    fn max_fee_per_gas(&self) -> u128 {
-        match self {
-            Self::Left(tx) => tx.max_fee_per_gas(),
-            Self::Right(tx) => tx.max_fee_per_gas(),
-        }
-    }
-
-    fn max_priority_fee_per_gas(&self) -> Option<u128> {
-        match self {
-            Self::Left(tx) => tx.max_priority_fee_per_gas(),
-            Self::Right(tx) => tx.max_priority_fee_per_gas(),
-        }
-    }
-
-    fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        match self {
-            Self::Left(tx) => tx.max_fee_per_blob_gas(),
-            Self::Right(tx) => tx.max_fee_per_blob_gas(),
-        }
-    }
-
-    fn priority_fee_or_price(&self) -> u128 {
-        match self {
-            Self::Left(tx) => tx.priority_fee_or_price(),
-            Self::Right(tx) => tx.priority_fee_or_price(),
-        }
-    }
-
-    fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
-        match self {
-            Self::Left(tx) => tx.effective_gas_price(base_fee),
-            Self::Right(tx) => tx.effective_gas_price(base_fee),
-        }
-    }
-
-    fn effective_tip_per_gas(&self, base_fee: u64) -> Option<u128> {
-        match self {
-            Self::Left(tx) => tx.effective_tip_per_gas(base_fee),
-            Self::Right(tx) => tx.effective_tip_per_gas(base_fee),
-        }
-    }
-
-    fn is_dynamic_fee(&self) -> bool {
-        match self {
-            Self::Left(tx) => tx.is_dynamic_fee(),
-            Self::Right(tx) => tx.is_dynamic_fee(),
-        }
-    }
-
-    fn kind(&self) -> TxKind {
-        match self {
-            Self::Left(tx) => tx.kind(),
-            Self::Right(tx) => tx.kind(),
-        }
-    }
-
-    fn is_create(&self) -> bool {
-        match self {
-            Self::Left(tx) => tx.is_create(),
-            Self::Right(tx) => tx.is_create(),
-        }
-    }
-
-    fn to(&self) -> Option<Address> {
-        match self {
-            Self::Left(tx) => tx.to(),
-            Self::Right(tx) => tx.to(),
-        }
-    }
-
-    fn value(&self) -> U256 {
-        match self {
-            Self::Left(tx) => tx.value(),
-            Self::Right(tx) => tx.value(),
-        }
-    }
-
-    fn input(&self) -> &Bytes {
-        match self {
-            Self::Left(tx) => tx.input(),
-            Self::Right(tx) => tx.input(),
-        }
-    }
-
-    fn function_selector(&self) -> Option<&Selector> {
-        match self {
-            Self::Left(tx) => tx.function_selector(),
-            Self::Right(tx) => tx.function_selector(),
-        }
-    }
-
-    fn access_list(&self) -> Option<&AccessList> {
-        match self {
-            Self::Left(tx) => tx.access_list(),
-            Self::Right(tx) => tx.access_list(),
-        }
-    }
-
-    fn blob_versioned_hashes(&self) -> Option<&[B256]> {
-        match self {
-            Self::Left(tx) => tx.blob_versioned_hashes(),
-            Self::Right(tx) => tx.blob_versioned_hashes(),
-        }
-    }
-
-    fn blob_count(&self) -> Option<u64> {
-        match self {
-            Self::Left(tx) => tx.blob_count(),
-            Self::Right(tx) => tx.blob_count(),
-        }
-    }
-
-    fn blob_gas_used(&self) -> Option<u64> {
-        match self {
-            Self::Left(tx) => tx.blob_gas_used(),
-            Self::Right(tx) => tx.blob_gas_used(),
-        }
-    }
-
-    fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
-        match self {
-            Self::Left(tx) => tx.authorization_list(),
-            Self::Right(tx) => tx.authorization_list(),
-        }
-    }
-
-    fn authorization_count(&self) -> Option<u64> {
-        match self {
-            Self::Left(tx) => tx.authorization_count(),
-            Self::Right(tx) => tx.authorization_count(),
-        }
-    }
+    delegate_transaction!(self => match Self::Left, Self::Right);
 }
 
 /// Trait for types that provide access to a transaction hash reference.
@@ -598,10 +372,31 @@ impl<T: TxHashRef + Clone> TxHashRef for Cow<'_, T> {
 mod tests {
     use crate::{Signed, TransactionEnvelope, TxEip1559, TxEnvelope, TxType};
     use alloy_primitives::Signature;
+    use serde::{Serialize, Serializer};
+
+    #[test]
+    fn test_flatten_only_envelope() {
+        #[derive(Debug, Clone, TransactionEnvelope)]
+        #[envelope(alloy_consensus = crate, tx_type_name = WrapperTxType)]
+        enum Wrapper {
+            #[envelope(flatten)]
+            Ethereum(TxEnvelope),
+        }
+
+        let tx: TxEnvelope = Signed::new_unhashed(
+            TxEip1559 { chain_id: 1, gas_limit: 21000, ..Default::default() },
+            Signature::new(Default::default(), Default::default(), Default::default()),
+        )
+        .into();
+
+        let json = serde_json::to_string(&tx).unwrap();
+        assert_eq!(serde_json::to_string(&Wrapper::Ethereum(tx.clone())).unwrap(), json);
+        let Wrapper::Ethereum(decoded) = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, tx);
+    }
 
     #[test]
     fn test_custom_envelope() {
-        use serde::{Serialize, Serializer};
         fn serialize_with<S: Serializer>(
             tx: &Signed<TxEip1559>,
             serializer: S,

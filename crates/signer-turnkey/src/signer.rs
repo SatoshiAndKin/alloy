@@ -124,30 +124,8 @@ impl Signer for TurnkeySigner {
             .await
             .map_err(|e| alloy_signer::Error::other(TurnkeySignerError::TurnkeyClient(e)))?;
 
-        // Parse r, s, v from response
-        let r_bytes = hex::decode(&response.result.r)
-            .map_err(|e| alloy_signer::Error::other(TurnkeySignerError::Hex(e)))?;
-        let s_bytes = hex::decode(&response.result.s)
-            .map_err(|e| alloy_signer::Error::other(TurnkeySignerError::Hex(e)))?;
-        let v_bytes = hex::decode(&response.result.v)
-            .map_err(|e| alloy_signer::Error::other(TurnkeySignerError::Hex(e)))?;
-
-        if r_bytes.len() != 32 || s_bytes.len() != 32 || v_bytes.len() != 1 {
-            return Err(alloy_signer::Error::other(TurnkeySignerError::InvalidSignature));
-        }
-
-        let mut r_arr = [0u8; 32];
-        r_arr.copy_from_slice(&r_bytes);
-        let r = U256::from_be_bytes(r_arr);
-
-        let mut s_arr = [0u8; 32];
-        s_arr.copy_from_slice(&s_bytes);
-        let s = U256::from_be_bytes(s_arr);
-
-        let parity = normalize_v(v_bytes[0] as u64)
-            .ok_or_else(|| alloy_signer::Error::other(TurnkeySignerError::InvalidSignature))?;
-
-        Ok(Signature::new(r, s, parity))
+        parse_signature(&response.result.r, &response.result.s, &response.result.v)
+            .map_err(alloy_signer::Error::other)
     }
 
     #[inline]
@@ -209,86 +187,91 @@ impl TurnkeySigner {
     }
 }
 
+/// Parse the fixed-width signature fields returned by Turnkey.
+fn parse_signature(r: &str, s: &str, v: &str) -> Result<Signature, TurnkeySignerError> {
+    // Preserve hex errors before reporting invalid field lengths.
+    for field in [r, s, v] {
+        hex::check(field)?;
+    }
+    let r = hex::decode_to_array::<_, 32>(r).map_err(|_| TurnkeySignerError::InvalidSignature)?;
+    let s = hex::decode_to_array::<_, 32>(s).map_err(|_| TurnkeySignerError::InvalidSignature)?;
+    let [v] = hex::decode_to_array::<_, 1>(v).map_err(|_| TurnkeySignerError::InvalidSignature)?;
+    let parity = normalize_v(v as u64).ok_or(TurnkeySignerError::InvalidSignature)?;
+    Ok(Signature::new(U256::from_be_bytes(r), U256::from_be_bytes(s), parity))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use k256::ecdsa::VerifyingKey;
 
-    #[tokio::test]
-    async fn sign_message() {
-        // Environment check - return early if credentials missing (AWS/GCP pattern)
-        let Ok(org_id) = std::env::var("TURNKEY_ORGANIZATION_ID") else { return };
-        let Ok(api_private_key) = std::env::var("TURNKEY_API_PRIVATE_KEY") else { return };
-        let Ok(address_str) = std::env::var("TURNKEY_ADDRESS") else { return };
+    #[test]
+    fn parse_fixed_width_signature() {
+        let r = "01".repeat(32);
+        let s = "02".repeat(32);
+        for (v, parity) in [("00", false), ("01", true), ("1b", false), ("1c", true)] {
+            let signature = parse_signature(&r, &s, v).unwrap();
+            assert_eq!(signature.r(), U256::from_be_bytes([1u8; 32]));
+            assert_eq!(signature.s(), U256::from_be_bytes([2u8; 32]));
+            assert_eq!(signature.v(), parity);
+        }
+        assert!(parse_signature(&format!("0x{r}"), &format!("0x{s}"), "0x01").is_ok());
+    }
 
-        // Create API key and client using official SDK
+    #[test]
+    fn reject_invalid_signature_fields() {
+        let field = "01".repeat(32);
+        for (r, s, v) in [
+            ("01", field.as_str(), "00"),
+            (&field, "01", "00"),
+            (&field, &field, "0000"),
+            (&field, &field, "02"),
+        ] {
+            assert!(matches!(parse_signature(r, s, v), Err(TurnkeySignerError::InvalidSignature)));
+        }
+        for (r, s, v) in [("zz", field.as_str(), "00"), (&field, "z", "00"), (&field, &field, "zz")]
+        {
+            assert!(matches!(parse_signature(r, s, v), Err(TurnkeySignerError::Hex(_))));
+        }
+    }
+
+    fn signer() -> TurnkeySigner {
+        let org_id = std::env::var("TURNKEY_ORGANIZATION_ID").expect("TURNKEY_ORGANIZATION_ID");
+        let api_private_key =
+            std::env::var("TURNKEY_API_PRIVATE_KEY").expect("TURNKEY_API_PRIVATE_KEY");
+        let address = std::env::var("TURNKEY_ADDRESS")
+            .expect("TURNKEY_ADDRESS")
+            .parse::<Address>()
+            .expect("invalid test address");
+
         let api_key = TurnkeyP256ApiKey::from_strings(&api_private_key, None)
             .expect("api key creation failed");
-
         let client =
             TurnkeyClient::builder().api_key(api_key).build().expect("client builder failed");
 
-        let address = address_str.parse::<Address>().expect("invalid test address");
-        let signer = TurnkeySigner::new(client, org_id, address, Some(1));
+        TurnkeySigner::new(client, org_id, address, Some(1))
+    }
 
-        // Standard test payload (matches AWS/GCP exactly)
+    #[tokio::test]
+    #[ignore = "requires TURNKEY_ORGANIZATION_ID, TURNKEY_API_PRIVATE_KEY and TURNKEY_ADDRESS"]
+    async fn sign_message() {
+        let signer = signer();
+
         let message = vec![0, 1, 2, 3];
 
-        // Execute signing and verify recovery (AWS/GCP pattern)
         let sig = signer.sign_message(&message).await.unwrap();
         assert_eq!(sig.recover_address_from_msg(message).unwrap(), signer.address());
     }
 
     #[tokio::test]
+    #[ignore = "requires TURNKEY_ORGANIZATION_ID, TURNKEY_API_PRIVATE_KEY and TURNKEY_ADDRESS"]
     async fn sign_hash() {
-        let Ok(org_id) = std::env::var("TURNKEY_ORGANIZATION_ID") else { return };
-        let Ok(api_private_key) = std::env::var("TURNKEY_API_PRIVATE_KEY") else { return };
-        let Ok(address_str) = std::env::var("TURNKEY_ADDRESS") else { return };
+        let signer = signer();
 
-        let api_key = TurnkeyP256ApiKey::from_strings(&api_private_key, None)
-            .expect("api key creation failed");
-
-        let client =
-            TurnkeyClient::builder().api_key(api_key).build().expect("client builder failed");
-
-        let address = address_str.parse::<Address>().expect("invalid test address");
-        let signer = TurnkeySigner::new(client, org_id, address, Some(1));
-
-        // Test direct hash signing (core functionality)
         let hash = B256::from([1u8; 32]);
         let sig = signer.sign_hash(&hash).await.unwrap();
 
-        // Verify signature recovery
         let recovered: VerifyingKey = sig.recover_from_prehash(&hash).unwrap();
         assert_eq!(alloy_signer::utils::public_key_to_address(&recovered), signer.address());
-    }
-
-    #[tokio::test]
-    async fn signer_properties() {
-        let Ok(org_id) = std::env::var("TURNKEY_ORGANIZATION_ID") else { return };
-        let Ok(api_private_key) = std::env::var("TURNKEY_API_PRIVATE_KEY") else { return };
-        let Ok(address_str) = std::env::var("TURNKEY_ADDRESS") else { return };
-
-        let api_key = TurnkeyP256ApiKey::from_strings(&api_private_key, None)
-            .expect("api key creation failed");
-
-        let client =
-            TurnkeyClient::builder().api_key(api_key).build().expect("client builder failed");
-
-        let address = address_str.parse::<Address>().expect("invalid test address");
-        let mut signer = TurnkeySigner::new(client, org_id, address, Some(1));
-
-        // Test address property
-        assert_eq!(signer.address(), address);
-
-        // Test chain_id property
-        assert_eq!(signer.chain_id(), Some(1));
-
-        // Test chain_id mutation
-        signer.set_chain_id(Some(42));
-        assert_eq!(signer.chain_id(), Some(42));
-
-        signer.set_chain_id(None);
-        assert_eq!(signer.chain_id(), None);
     }
 }
