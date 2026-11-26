@@ -349,7 +349,7 @@ jobs:
   ci-success:
     name: ci success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - test
       - doctest
