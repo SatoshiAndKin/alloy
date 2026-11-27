@@ -24,7 +24,7 @@ jobs:
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: audit
-          token: ""
+          token: ${{ github.token }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -46,7 +46,7 @@ jobs:
         with:
           inputs: .
           persona: regular
-          version: v1.33.1
+          version: 1.29.0 # Exact image digest provided by the immutable action.
           online-audits: true
           advanced-security: false
           annotations: true
