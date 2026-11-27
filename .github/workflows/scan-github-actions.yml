@@ -14,10 +14,43 @@ permissions: {}
 
 jobs:
   scan:
-    uses: tempoxyz/gh-actions/.github/workflows/scan-github-actions.yml@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
+    name: Scan GitHub Actions
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
-      id-token: write
-    with:
-      ensure-secure-runner: false
+    steps:
+      - name: Audit runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          token: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test CI tool verification
+        run: python3 -m unittest discover -s .github/scripts -p test_ci_tools.py
+      - name: Install verified scanners
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/install_ci_tools.py pinact
+          python3 .github/scripts/install_ci_tools.py actionlint
+      - name: Check action pin policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check_action_pins.py
+      - name: Scan GitHub Actions
+        if: ${{ !cancelled() }}
+        uses: tempoxyz/gh-actions/vendor/zizmorcore/zizmor-action@392079a54ac0240e1b21417eca38b7c0a50bf55d # 2026-10-01T18-10-09Z-392079a5
+        with:
+          inputs: .
+          persona: regular
+          version: 1.29.0 # Exact image digest provided by the immutable action.
+          online-audits: true
+          advanced-security: false
+          annotations: true
+          token: ${{ github.token }}
+      - name: Lint GitHub Actions
+        if: ${{ !cancelled() }}
+        run: '"${RUNNER_TEMP}/alloy-ci-tools/actionlint/actionlint" -color'
